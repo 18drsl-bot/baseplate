@@ -97,8 +97,9 @@ local state = {
 	active = false,        -- true while ground is being generated
 	cleared = false,       -- true after pressing Clear
 	decor = true,          -- the spawned grass pieces on/off (Blades button)
-	dropIdx = 4,           -- DROPS[4] = 3 studs below the baseplate
-	chopIdx = 3,           -- CHOPS[3] = "Med"
+	dropIdx = 1,           -- DROPS[1] = 0, ground is flush with the floor you walk on
+	chopIdx = 2,           -- CHOPS[2] = "Low" (gentle bumps)
+	floorY = 0,            -- height of the floor you stand on
 	topY = 0,              -- height of the level ground top (bumps dip below this)
 	hadPlate = false,
 	needHide = true,
@@ -458,8 +459,11 @@ local function computeGround()
 	end
 	state.hadPlate = best ~= nil
 	if best then
-		state.topY = best.Position.Y + best.Size.Y / 2 - DROPS[state.dropIdx]
+		-- floorY = the surface you actually stand on; the terrain sits Drop studs under it
+		state.floorY = best.Position.Y + best.Size.Y / 2
+		state.topY = state.floorY - DROPS[state.dropIdx]
 	else
+		state.floorY = 0
 		state.topY = 0
 	end
 end
@@ -501,16 +505,6 @@ local function bumpDepth(wx, wz, amp, scale)
 	return amp * math.clamp(v + 0.5, 0, 1)
 end
 
--- Height of the built ground at x, z, so grass pieces sit on it
-local function surfaceAt(x, z, amp)
-	if amp <= 0 then return state.topY end
-	local cfg = CHOPS[state.chopIdx]
-	local cell = cfg.cell
-	local wx = (math.floor(x / cell) + 0.5) * cell
-	local wz = (math.floor(z / cell) + 0.5) * cell
-	return state.topY - bumpDepth(wx, wz, amp, cfg.scale)
-end
-
 local function clearGrass()
 	for k, g in pairs(grass) do
 		pcall(function() g.folder:Destroy() end)
@@ -527,7 +521,8 @@ local function spawnGrass(key, cx, cz)
 	for _ = 1, GRASS_PER_CHUNK do
 		local x = cx + (rng:NextNumber() - 0.5) * CHUNK
 		local z = cz + (rng:NextNumber() - 0.5) * CHUNK
-		local y = surfaceAt(x, z, amp) + GRASS_SIZE.Y / 2 - 0.3
+		-- stand the pieces on the floor you walk on, right under your feet
+		local y = state.floorY + GRASS_SIZE.Y / 2 - 0.3
 		local p = Instance.new("Part")
 		p.Name = "Grass"
 		p.Size = GRASS_SIZE
