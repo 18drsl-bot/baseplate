@@ -42,7 +42,6 @@ local origTrans = env.TerrainOrigTrans
 -- ============================================================
 
 local CHUNK         = 128                       -- ground is generated in squares this wide
-local RES           = 4                         -- terrain voxel size (fixed by Roblox)
 local FILL_DEPTH    = 8                         -- ground layer thickness
 local AMP_MAX       = 8                         -- deepest bump any Chop setting can make
 local BUDGET        = 0.004                     -- max seconds of terrain work per frame
@@ -51,10 +50,10 @@ local BUDGET        = 0.004                     -- max seconds of terrain work p
 local DROPS = { 0, 1, 2, 3, 4, 6, 8 }
 -- Chop = how bumpy grass is. Bumps only dip DOWN from the level top, so nothing pokes above the floor.
 local CHOPS = {
-	{ name = "Off",  amp = 0, scale = 48 },
-	{ name = "Low",  amp = 2, scale = 48 },
-	{ name = "Med",  amp = 4, scale = 32 },
-	{ name = "High", amp = 7, scale = 22 },
+	{ name = "Off",  amp = 0, scale = 48, cell = 16 },
+	{ name = "Low",  amp = 2, scale = 48, cell = 16 },
+	{ name = "Med",  amp = 4, scale = 32, cell = 16 },
+	{ name = "High", amp = 7, scale = 22, cell = 8  },
 }
 local UNLOAD_MARGIN = 768                       -- ground this far past your range gets removed
 local RMIN          = 256
@@ -513,53 +512,49 @@ local function plan(f)
 	end
 end
 
--- Builds one chunk as a grid of voxel columns so the grass top can be bumpy.
+-- Builds one chunk. Flat ground is a single block; choppy grass is a grid of columns.
 -- Every column starts from the same level top and only dips down by its bump depth.
-local function writeChunk(item, mat, amp)
+-- (FillBlock only, so it works anywhere FillBlock works.)
+local function writeChunk(item, mat, amp, rebuild)
 	local top = state.topY
-	local yMin = math.floor((top - FILL_DEPTH - AMP_MAX) / RES) * RES
-	local yMax = math.ceil(top / RES) * RES + RES
-	local n = CHUNK / RES
-	local ny = (yMax - yMin) / RES
+	local yMin = top - FILL_DEPTH - AMP_MAX - 4
+	local yMax = top + 4
 	local x0, z0 = item.x - CHUNK / 2, item.z - CHUNK / 2
-	local scale = CHOPS[state.chopIdx].scale
-	local air = Enum.Material.Air
-	local mats, occs = {}, {}
-	for ix = 1, n do
-		local mx, oc = {}, {}
-		for iy = 1, ny do
-			mx[iy] = {}
-			oc[iy] = {}
-		end
-		local wx = x0 + (ix - 0.5) * RES
-		for iz = 1, n do
-			local wz = z0 + (iz - 0.5) * RES
-			local depth = 0
-			if amp > 0 then
-				local v = math.noise(wx / scale, wz / scale, 0.37) * 1.2
-					+ math.noise(wx / (scale * 0.4), wz / (scale * 0.4), 5.11) * 0.6
-				depth = amp * math.clamp(v + 0.5, 0, 1)
-			end
-			local h = top - depth
-			for iy = 1, ny do
-				local occ = (h - (yMin + (iy - 1) * RES)) / RES
-				if occ >= 1 then
-					mx[iy][iz] = mat
-					oc[iy][iz] = 1
-				elseif occ > 0.02 then
-					mx[iy][iz] = mat
-					oc[iy][iz] = occ
-				else
-					mx[iy][iz] = air
-					oc[iy][iz] = 0
-				end
-			end
-		end
-		mats[ix] = mx
-		occs[ix] = oc
+
+	if amp <= 0 then
+		terrain:FillBlock(
+			CFrame.new(item.x, top - FILL_DEPTH / 2, item.z),
+			Vector3.new(CHUNK, FILL_DEPTH, CHUNK),
+			mat
+		)
+		return yMin, yMax
 	end
-	local region = Region3.new(Vector3.new(x0, yMin, z0), Vector3.new(x0 + CHUNK, yMax, z0 + CHUNK))
-	terrain:WriteVoxels(region, RES, mats, occs)
+
+	if rebuild then
+		-- clear everything above the lowest possible bump so older, higher ground doesn't stay behind
+		local lo = top - AMP_MAX
+		terrain:FillBlock(
+			CFrame.new(item.x, (lo + yMax) / 2, item.z),
+			Vector3.new(CHUNK, yMax - lo, CHUNK),
+			Enum.Material.Air
+		)
+	end
+
+	local cfg = CHOPS[state.chopIdx]
+	local cell, scale = cfg.cell, cfg.scale
+	local n = CHUNK / cell
+	local bottom = top - amp - FILL_DEPTH
+	for ix = 1, n do
+		local wx = x0 + (ix - 0.5) * cell
+		for iz = 1, n do
+			local wz = z0 + (iz - 0.5) * cell
+			local v = math.noise(wx / scale, wz / scale, 0.37) * 1.2
+				+ math.noise(wx / (scale * 0.4), wz / (scale * 0.4), 5.11) * 0.6
+			local depth = amp * math.clamp(v + 0.5, 0, 1)
+			local h = (top - depth) - bottom
+			terrain:FillBlock(CFrame.new(wx, bottom + h / 2, wz), Vector3.new(cell, h, cell), mat)
+		end
+	end
 	return yMin, yMax
 end
 
@@ -577,7 +572,7 @@ local function processItem(item)
 	local mat, amp = state.material, currentAmp()
 	local old = built[item.key]
 	if old and old.mat == mat and old.amp == amp then return end
-	local ok, a, b = pcall(writeChunk, item, mat, amp)
+	local ok, a, b = pcall(writeChunk, item, mat, amp, old ~= nil)
 	if ok then
 		if not old then builtCount = builtCount + 1 end
 		built[item.key] = { x = item.x, z = item.z, yMin = a, yMax = b, mat = mat, amp = amp }
