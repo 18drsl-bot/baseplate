@@ -33,6 +33,13 @@ local function track(conn)
 	return conn
 end
 
+-- All spawned grass pieces live in this folder
+local oldGrass = workspace:FindFirstChild("TerrainGrassBlades")
+if oldGrass then oldGrass:Destroy() end
+local grassFolder = Instance.new("Folder")
+grassFolder.Name = "TerrainGrassBlades"
+grassFolder.Parent = workspace
+
 -- Remembers each baseplate's real transparency (survives re-running the script)
 env.TerrainOrigTrans = env.TerrainOrigTrans or setmetatable({}, { __mode = "k" })
 local origTrans = env.TerrainOrigTrans
@@ -45,6 +52,12 @@ local CHUNK         = 128                       -- ground is generated in square
 local FILL_DEPTH    = 8                         -- ground layer thickness
 local AMP_MAX       = 8                         -- deepest bump any Chop setting can make
 local BUDGET        = 0.004                     -- max seconds of terrain work per frame
+
+-- Grass pieces (small green parts scattered over the ground)
+local GRASS_SIZE      = Vector3.new(0.5, 2, 0.5)           -- size of each grass piece
+local GRASS_COLOR     = Color3.fromRGB(34, 139, 34)        -- dark green
+local GRASS_PER_CHUNK = isTouch and 45 or 80               -- pieces per 128x128 square
+local GRASS_RADIUS    = isTouch and 100 or 160             -- grass pieces only exist this close to you
 
 -- Drop = how far the grass sits below the baseplate surface (same level everywhere)
 local DROPS = { 0, 1, 2, 3, 4, 6, 8 }
@@ -83,7 +96,7 @@ local state = {
 	range = DEFAULT_RANGE,
 	active = false,        -- true while ground is being generated
 	cleared = false,       -- true after pressing Clear
-	decor = false,         -- grass blades off = simple grass
+	decor = true,          -- the spawned grass pieces on/off (Blades button)
 	dropIdx = 4,           -- DROPS[4] = 3 studs below the baseplate
 	chopIdx = 3,           -- CHOPS[3] = "Med"
 	topY = 0,              -- height of the level ground top (bumps dip below this)
@@ -93,6 +106,7 @@ local state = {
 local plates = {}          -- set of baseplate parts: part -> true
 local built = {}           -- chunk key -> { x, y, z, mat }
 local builtCount = 0
+local grass = {}           -- chunk key -> { folder, x, z, amp, top, chop }
 local queue, qi = {}, 1    -- pending work, nearest chunks first
 local dirty, announce = false, false
 local lastFocus = nil
@@ -480,6 +494,56 @@ local function currentAmp()
 	return 0
 end
 
+-- How far the grass dips below the level top at this spot (same formula the ground uses)
+local function bumpDepth(wx, wz, amp, scale)
+	local v = math.noise(wx / scale, wz / scale, 0.37) * 1.2
+		+ math.noise(wx / (scale * 0.4), wz / (scale * 0.4), 5.11) * 0.6
+	return amp * math.clamp(v + 0.5, 0, 1)
+end
+
+-- Height of the built ground at x, z, so grass pieces sit on it
+local function surfaceAt(x, z, amp)
+	if amp <= 0 then return state.topY end
+	local cfg = CHOPS[state.chopIdx]
+	local cell = cfg.cell
+	local wx = (math.floor(x / cell) + 0.5) * cell
+	local wz = (math.floor(z / cell) + 0.5) * cell
+	return state.topY - bumpDepth(wx, wz, amp, cfg.scale)
+end
+
+local function clearGrass()
+	for k, g in pairs(grass) do
+		pcall(function() g.folder:Destroy() end)
+		grass[k] = nil
+	end
+end
+
+-- Scatters grass pieces over one chunk (same random layout every time for the same chunk)
+local function spawnGrass(key, cx, cz)
+	local amp = currentAmp()
+	local rng = Random.new(key)
+	local folder = Instance.new("Folder")
+	folder.Name = "G" .. key
+	for _ = 1, GRASS_PER_CHUNK do
+		local x = cx + (rng:NextNumber() - 0.5) * CHUNK
+		local z = cz + (rng:NextNumber() - 0.5) * CHUNK
+		local y = surfaceAt(x, z, amp) + GRASS_SIZE.Y / 2 - 0.3
+		local p = Instance.new("Part")
+		p.Name = "Grass"
+		p.Size = GRASS_SIZE
+		p.CFrame = CFrame.new(x, y, z) * CFrame.Angles(0, rng:NextNumber() * math.pi * 2, 0)
+		p.Anchored = true
+		p.CanCollide = false   -- so you walk through it instead of tripping
+		p.CanQuery = false
+		p.CanTouch = false
+		p.Material = Enum.Material.Grass
+		p.Color = GRASS_COLOR
+		p.Parent = folder
+	end
+	folder.Parent = grassFolder
+	grass[key] = { folder = folder, x = cx, z = cz, amp = amp, top = state.topY, chop = state.chopIdx }
+end
+
 -- Works out which chunks to add (nearest first) and which far ones to remove
 local function plan(f)
 	lastFocus = f
@@ -508,6 +572,35 @@ local function plan(f)
 		local dx, dz = c.x - f.X, c.z - f.Z
 		if math.sqrt(dx * dx + dz * dz) > ur then
 			queue[#queue + 1] = { key = k, unload = true }
+		end
+	end
+
+	-- grass pieces: only near you, and only on grass ground
+	local wantGrass = state.decor and mat == Enum.Material.Grass
+	if wantGrass then
+		local near = {}
+		local gspan = math.ceil(GRASS_RADIUS / CHUNK) + 1
+		for cx = fcx - gspan, fcx + gspan do
+			for cz = fcz - gspan, fcz + gspan do
+				local x, z = cx * CHUNK + CHUNK / 2, cz * CHUNK + CHUNK / 2
+				local dx, dz = x - f.X, z - f.Z
+				local d = math.sqrt(dx * dx + dz * dz)
+				if d <= GRASS_RADIUS then
+					local k = keyOf(cx, cz)
+					local g = grass[k]
+					if not g or g.amp ~= amp or g.top ~= state.topY or g.chop ~= state.chopIdx then
+						near[#near + 1] = { key = k, x = x, z = z, d = d, grass = true }
+					end
+				end
+			end
+		end
+		table.sort(near, function(a, b) return a.d < b.d end)
+		for _, it in ipairs(near) do queue[#queue + 1] = it end
+	end
+	for k, g in pairs(grass) do
+		local dx, dz = g.x - f.X, g.z - f.Z
+		if not wantGrass or math.sqrt(dx * dx + dz * dz) > GRASS_RADIUS + 64 then
+			queue[#queue + 1] = { key = k, ungrass = true }
 		end
 	end
 end
@@ -548,9 +641,7 @@ local function writeChunk(item, mat, amp, rebuild)
 		local wx = x0 + (ix - 0.5) * cell
 		for iz = 1, n do
 			local wz = z0 + (iz - 0.5) * cell
-			local v = math.noise(wx / scale, wz / scale, 0.37) * 1.2
-				+ math.noise(wx / (scale * 0.4), wz / (scale * 0.4), 5.11) * 0.6
-			local depth = amp * math.clamp(v + 0.5, 0, 1)
+			local depth = bumpDepth(wx, wz, amp, scale)
 			local h = (top - depth) - bottom
 			terrain:FillBlock(CFrame.new(wx, bottom + h / 2, wz), Vector3.new(cell, h, cell), mat)
 		end
@@ -559,6 +650,29 @@ local function writeChunk(item, mat, amp, rebuild)
 end
 
 local function processItem(item)
+	if item.ungrass then
+		local g = grass[item.key]
+		if g then
+			pcall(function() g.folder:Destroy() end)
+			grass[item.key] = nil
+		end
+		return
+	end
+	if item.grass then
+		if not state.decor or state.material ~= Enum.Material.Grass then return end
+		local g = grass[item.key]
+		if g then
+			pcall(function() g.folder:Destroy() end)
+			grass[item.key] = nil
+		end
+		local okG, eG = pcall(spawnGrass, item.key, item.x, item.z)
+		if not okG then
+			state.decor = false
+			setStatus("Grass pieces off: " .. tostring(eG), C.bad)
+			warn("[TerrainGUI] " .. tostring(eG))
+		end
+		return
+	end
 	if item.unload then
 		local c = built[item.key]
 		if c then
@@ -599,6 +713,7 @@ local function beginBuild(label, wipe)
 	if wipe then
 		pcall(function() terrain:Clear() end)
 		built, builtCount = {}, 0
+		clearGrass()
 	end
 	dirty = true
 	planTimer = 1   -- plan on the very next frame
@@ -619,6 +734,7 @@ local function clearAll()
 	announce = false
 	queue, qi = {}, 1
 	built, builtCount = {}, 0
+	clearGrass()
 	terrain:Clear()
 	restorePlates()
 end
@@ -687,7 +803,7 @@ local function pick(i)
 	else
 		state.material = m.mat
 		pcall(function()
-			terrain.Decoration = state.decor
+			terrain.Decoration = false   -- the spawned grass pieces replace the built-in blades
 			terrain:SetMaterialColor(m.mat, m.color)
 		end)
 		beginBuild(m.label, false)
@@ -716,7 +832,10 @@ refreshDecorText()
 track(decorBtn.Activated:Connect(function()
 	state.decor = not state.decor
 	refreshDecorText()
-	pcall(function() terrain.Decoration = state.decor end)
+	if state.active then
+		dirty = true
+		planTimer = 1   -- add or remove the grass pieces right away
+	end
 end))
 
 -- Drop: how far below the baseplate the grass sits (same level everywhere)
@@ -885,7 +1004,7 @@ end))
 
 highlight(1)
 pcall(function()
-	terrain.Decoration = state.decor
+	terrain.Decoration = false
 	terrain:SetMaterialColor(MATS[1].mat, MATS[1].color)
 end)
 pcall(scan)
