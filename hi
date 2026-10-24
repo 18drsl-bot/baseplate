@@ -41,16 +41,25 @@ local origTrans = env.TerrainOrigTrans
 -- SETTINGS
 -- ============================================================
 
-local CHUNK         = 256                       -- ground is generated in squares this wide
+local CHUNK         = 128                       -- ground is generated in squares this wide
+local RES           = 4                         -- terrain voxel size (fixed by Roblox)
 local FILL_DEPTH    = 8                         -- ground layer thickness
-local DROP          = 0.5                       -- ground top sits this far under the baseplate surface
+local AMP_MAX       = 8                         -- deepest bump any Chop setting can make
 local BUDGET        = 0.004                     -- max seconds of terrain work per frame
+
+-- Drop = how far the grass sits below the baseplate surface (same level everywhere)
+local DROPS = { 0, 1, 2, 3, 4, 6, 8 }
+-- Chop = how bumpy grass is. Bumps only dip DOWN from the level top, so nothing pokes above the floor.
+local CHOPS = {
+	{ name = "Off",  amp = 0, scale = 48 },
+	{ name = "Low",  amp = 2, scale = 48 },
+	{ name = "Med",  amp = 4, scale = 32 },
+	{ name = "High", amp = 7, scale = 22 },
+}
 local UNLOAD_MARGIN = 768                       -- ground this far past your range gets removed
 local RMIN          = 256
 local RMAX          = isTouch and 2000 or 4000  -- slider limits (studs)
 local DEFAULT_RANGE = isTouch and 800 or 1500
-
-local CHUNK_SIZE = Vector3.new(CHUNK + 4, FILL_DEPTH, CHUNK + 4)   -- overlaps neighbours so no seams
 
 -- ============================================================
 -- MATERIALS (all are real terrain materials, so FillBlock works)
