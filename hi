@@ -1,4 +1,4 @@
--- Terrain Converter GUI (Blue) - mobile friendly, time-sliced fills
+-- Terrain Converter GUI (Blue) - endless flat ground, mobile friendly
 -- Run as an executor script, or as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -41,19 +41,23 @@ local origTrans = env.TerrainOrigTrans
 -- SETTINGS
 -- ============================================================
 
-local TILE        = 256                    -- terrain is built in tiles this wide
-local FILL_DEPTH  = 8                      -- terrain layer thickness (baseplate stays solid below)
-local DROP        = 2.5                    -- terrain top sits this far below the baseplate surface
-local BUDGET      = 0.005                  -- max seconds of terrain work per frame
-local RADIUS      = isTouch and 1200 or 3000   -- only build terrain this close to you (it follows you)
-local FOLLOW_STEP = RADIUS * 0.3           -- move this far and new tiles get built
+local CHUNK         = 256                       -- ground is generated in squares this wide
+local FILL_DEPTH    = 8                         -- ground layer thickness
+local DROP          = 0.5                       -- ground top sits this far under the baseplate surface
+local BUDGET        = 0.004                     -- max seconds of terrain work per frame
+local UNLOAD_MARGIN = 768                       -- ground this far past your range gets removed
+local RMIN          = 256
+local RMAX          = isTouch and 2000 or 4000  -- slider limits (studs)
+local DEFAULT_RANGE = isTouch and 800 or 1500
+
+local CHUNK_SIZE = Vector3.new(CHUNK + 4, FILL_DEPTH, CHUNK + 4)   -- overlaps neighbours so no seams
 
 -- ============================================================
 -- MATERIALS (all are real terrain materials, so FillBlock works)
 -- ============================================================
 
 local MATS = {
-	{ label = "Grass",          mat = Enum.Material.Grass,    color = Color3.fromRGB(106, 190, 64)  },  -- bright, lush green
+	{ label = "Grass",          mat = Enum.Material.Grass,    color = Color3.fromRGB(90, 160, 65)   },
 	{ label = "Smooth Plastic", mat = Enum.Material.Concrete, color = Color3.fromRGB(185, 183, 180) },
 	{ label = "Plastic",        mat = Enum.Material.Pavement, color = Color3.fromRGB(170, 168, 165) },
 	{ label = "Sand",           mat = Enum.Material.Sand,     color = Color3.fromRGB(198, 172, 120) },
@@ -67,21 +71,22 @@ local MATS = {
 
 local state = {
 	material = Enum.Material.Grass,
-	mult = 1,
-	cleared = false,
-	decor = true,          -- grass blades give the lush look; turn off with the Decor button if it lags
-	needClear = true,
-	lastMult = nil,
-	lastMat = nil,
+	label = "Grass",
+	range = DEFAULT_RANGE,
+	active = false,        -- true while ground is being generated
+	cleared = false,       -- true after pressing Clear
+	decor = false,         -- grass blades off = simple flat grass
+	topY = 0,              -- height of the ground surface
+	hadPlate = false,
+	needHide = true,
 }
-local applied = {}         -- material + size of the last full apply
 local plates = {}          -- set of baseplate parts: part -> true
-local plateTiles = {}      -- plate -> { mult = n, list = { tiles } }
-local filled = {}          -- tile -> true once built with the current material
-local fakePlate = nil      -- stand-in used when the game has no baseplate
-local jobId, running = 0, false
+local built = {}           -- chunk key -> { x, y, z, mat }
+local builtCount = 0
+local queue, qi = {}, 1    -- pending work, nearest chunks first
+local dirty, announce = false, false
 local lastFocus = nil
-local dirty = false
+local planTimer, statusTimer = 0, 0
 
 -- ============================================================
 -- GUI
@@ -205,18 +210,18 @@ make("TextLabel", {
 	Size = UDim2.new(1, -P * 2, 0, 14),
 	Position = UDim2.new(0, P, 0, 8),
 	BackgroundTransparency = 1,
-	Text = "TERRAIN SIZE",
+	Text = "RANGE (STUDS)",
 	TextColor3 = C.sub,
 	Font = Enum.Font.Gotham,
 	TextSize = 10,
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, content)
 
-local sizeVal = make("TextLabel", {
-	Size = UDim2.new(0, 50, 0, 14),
-	Position = UDim2.new(1, -P - 50, 0, 8),
+local rangeVal = make("TextLabel", {
+	Size = UDim2.new(0, 60, 0, 14),
+	Position = UDim2.new(1, -P - 60, 0, 8),
 	BackgroundTransparency = 1,
-	Text = "1.00x",
+	Text = "",
 	TextColor3 = C.text,
 	Font = Enum.Font.GothamBold,
 	TextSize = 11,
@@ -240,7 +245,7 @@ local sliderTrack = make("Frame", {
 round(sliderTrack, 4)
 
 local sliderFill = make("Frame", {
-	Size = UDim2.new(0.27, 0, 1, 0),
+	Size = UDim2.new(0.3, 0, 1, 0),
 	BackgroundColor3 = C.fill,
 	BorderSizePixel = 0,
 }, sliderTrack)
@@ -249,7 +254,7 @@ round(sliderFill, 4)
 local knob = make("TextButton", {
 	Size = UDim2.new(0, KS, 0, KS),
 	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.new(0.27, 0, 0.5, 0),
+	Position = UDim2.new(0.3, 0, 0.5, 0),
 	BackgroundColor3 = C.knob,
 	BorderSizePixel = 0,
 	Text = "",
@@ -331,7 +336,7 @@ local function setStatus(text, color)
 end
 
 -- ============================================================
--- TERRAIN LOGIC
+-- BASEPLATES (found only to match the ground height and hide them)
 -- ============================================================
 
 local function nameLooksLikeFloor(name)
@@ -352,10 +357,32 @@ end
 
 -- Baseplate becomes invisible but stays solid, so walking height stays exact
 local function hide(p)
-	if p == fakePlate then return end
 	if origTrans[p] == nil then origTrans[p] = p.Transparency end
 	p.Transparency = 1
 	p.CanCollide = true
+end
+
+local function hideAll()
+	for p in pairs(plates) do
+		if p.Parent then
+			pcall(hide, p)
+		else
+			plates[p] = nil
+		end
+	end
+end
+
+local function restorePlates()
+	for p in pairs(plates) do
+		if p.Parent then
+			local o = origTrans[p]
+			if o == nil or o > 0.9 then o = 0 end
+			p.Transparency = o
+			p.CanCollide = true
+		else
+			plates[p] = nil
+		end
+	end
 end
 
 local function scan()
@@ -364,47 +391,31 @@ local function scan()
 	end
 end
 
--- Used only when the game has no baseplate at all (flat 2000x2000 floor at y = 0)
-local function makeFallback()
-	fakePlate = {
-		Parent = true,
-		Transparency = 0,
-		CanCollide = true,
-		Size = Vector3.new(2000, 4, 2000),
-		CFrame = CFrame.new(0, DROP - 2, 0),
-	}
-	plates[fakePlate] = true
-end
-
--- Splits one baseplate into square tiles so it can be built a few at a time
-local function buildTiles(p, mult)
-	local s = p.Size
-	local sx, sz = s.X * mult, s.Z * mult
-	local nx = math.max(1, math.ceil(sx / TILE))
-	local nz = math.max(1, math.ceil(sz / TILE))
-	local cx, cz = sx / nx, sz / nz
-	local localY = (s.Y / 2 - DROP) - FILL_DEPTH / 2
-	local base = p.CFrame * CFrame.new(0, localY, 0)
-	-- tiles overlap by one voxel so no seams show between them
-	local tileSize = Vector3.new(cx + (nx > 1 and 4 or 0), FILL_DEPTH, cz + (nz > 1 and 4 or 0))
-	local list = {}
-	for ix = 0, nx - 1 do
-		for iz = 0, nz - 1 do
-			local cf = base * CFrame.new(-sx / 2 + cx * (ix + 0.5), 0, -sz / 2 + cz * (iz + 0.5))
-			list[#list + 1] = { cf = cf, size = tileSize, pos = cf.Position, plate = p, d = 0 }
+-- Ground height = top of the biggest baseplate (or 0 if the game has none)
+local function computeGround()
+	local best, bestArea = nil, -1
+	for p in pairs(plates) do
+		if p.Parent then
+			local s = p.Size
+			if s.X * s.Z > bestArea then
+				bestArea = s.X * s.Z
+				best = p
+			end
+		else
+			plates[p] = nil
 		end
 	end
-	return list
+	state.hadPlate = best ~= nil
+	if best then
+		state.topY = best.Position.Y + best.Size.Y / 2 - DROP
+	else
+		state.topY = 0
+	end
 end
 
-local function getTiles(p)
-	local e = plateTiles[p]
-	if not e or e.mult ~= applied.mult then
-		e = { mult = applied.mult, list = buildTiles(p, applied.mult) }
-		plateTiles[p] = e
-	end
-	return e.list
-end
+-- ============================================================
+-- ENDLESS GROUND
+-- ============================================================
 
 local function focusPoint()
 	local ch = player.Character
@@ -420,141 +431,142 @@ local function flatDist(a, b)
 	return math.sqrt(dx * dx + dz * dz)
 end
 
--- Finds every tile near the player that still needs building
-local function collect(focus)
-	local pending, remain, partial, count = {}, {}, false, 0
-	for p in pairs(plates) do
-		if p.Parent then
-			count = count + 1
-			for _, t in ipairs(getTiles(p)) do
-				local d = flatDist(t.pos, focus)
-				if d <= RADIUS then
-					if not filled[t] then
-						t.d = d
-						pending[#pending + 1] = t
-						remain[p] = (remain[p] or 0) + 1
-					end
-				else
-					partial = true
-				end
-			end
-		else
-			plates[p] = nil
-			plateTiles[p] = nil
-		end
-	end
-	return pending, remain, partial, count
+local function keyOf(cx, cz)
+	return (cx + 20000) * 40001 + (cz + 20000)
 end
 
--- Builds terrain closest-to-you first, a few milliseconds per frame, so the game never freezes.
--- A newer click cancels the older job.
-local function startJob(label, opts)
-	opts = opts or {}
-	jobId = jobId + 1
-	local id = jobId
-	running = true
-	task.spawn(function()
-		local ok, res = pcall(function()
-			local focus = focusPoint()
-			lastFocus = focus
-			if not opts.topUp then
-				applied.mat, applied.mult = state.material, state.mult
-				filled = {}
-			end
-			local mat = applied.mat
-			local pending, remain, partial, count = collect(focus)
-
-			if not opts.topUp then
-				if count == 0 then
-					pcall(scan)
-					if next(plates) == nil then makeFallback() end
-					pending, remain, partial, count = collect(focus)
-				end
-				-- Only wipe terrain when it is really needed (size change, refresh, big maps)
-				if state.needClear or opts.forceClear or state.lastMult ~= applied.mult
-					or (partial and state.lastMat ~= mat) then
-					terrain:Clear()
-					state.needClear = false
-					filled = {}
-				end
-				state.lastMult, state.lastMat = applied.mult, mat
-				pcall(function() terrain.Decoration = state.decor end)
-			end
-
-			table.sort(pending, function(a, b) return a.d < b.d end)
-
-			local total, done, fails, firstErr = #pending, 0, 0, nil
-			local bad = {}
-			local t0 = os.clock()
-			for _, t in ipairs(pending) do
-				if id ~= jobId then return nil end
-				local okFill, e = pcall(terrain.FillBlock, terrain, t.cf, t.size, mat)
-				local p = t.plate
-				if okFill then
-					filled[t] = true
-				else
-					bad[p] = true
-					fails = fails + 1
-					firstErr = firstErr or tostring(e)
-				end
-				done = done + 1
-				remain[p] = remain[p] - 1
-				if remain[p] == 0 and not bad[p] then pcall(hide, p) end
-				if os.clock() - t0 > BUDGET then
-					if not opts.topUp then
-						setStatus(label .. ": " .. math.floor(done / total * 100) .. "%", C.warn)
-					end
-					task.wait()
-					t0 = os.clock()
-				end
-			end
-			return { count = count, partial = partial, fails = fails, err = firstErr, total = total }
-		end)
-
-		if id ~= jobId then return end   -- a newer job took over
-		running = false
-
-		if not ok then
-			setStatus("Error: " .. tostring(res), C.bad)
-			warn("[TerrainGUI] " .. tostring(res))
-		elseif res then
-			if res.fails > 0 then
-				setStatus(label .. ": " .. res.fails .. " tile(s) failed: " .. tostring(res.err), C.bad)
-				warn("[TerrainGUI] " .. tostring(res.err))
-			elseif not opts.topUp then
-				if fakePlate then
-					setStatus(label .. ": no baseplate found, used flat floor", C.warn)
-				elseif res.partial then
-					setStatus(label .. ": done (" .. res.count .. " plate(s), builds around you)", C.good)
-				else
-					setStatus(label .. ": done (" .. res.count .. " plate(s))", C.good)
+-- Works out which chunks to add (nearest first) and which far ones to remove
+local function plan(f)
+	lastFocus = f
+	queue, qi = {}, 1
+	local R = state.range
+	local span = math.ceil(R / CHUNK) + 1
+	local fcx, fcz = math.floor(f.X / CHUNK), math.floor(f.Z / CHUNK)
+	for cx = fcx - span, fcx + span do
+		for cz = fcz - span, fcz + span do
+			local x, z = cx * CHUNK + CHUNK / 2, cz * CHUNK + CHUNK / 2
+			local dx, dz = x - f.X, z - f.Z
+			local d = math.sqrt(dx * dx + dz * dz)
+			if d <= R then
+				local k = keyOf(cx, cz)
+				local c = built[k]
+				if not c or c.mat ~= state.material then
+					queue[#queue + 1] = { key = k, x = x, z = z, d = d }
 				end
 			end
 		end
-	end)
+	end
+	table.sort(queue, function(a, b) return a.d < b.d end)
+	local ur = R + UNLOAD_MARGIN
+	for k, c in pairs(built) do
+		local dx, dz = c.x - f.X, c.z - f.Z
+		if math.sqrt(dx * dx + dz * dz) > ur then
+			queue[#queue + 1] = { key = k, unload = true }
+		end
+	end
+end
+
+local function processItem(item)
+	if item.unload then
+		local c = built[item.key]
+		if c then
+			pcall(terrain.FillBlock, terrain, CFrame.new(c.x, c.y, c.z), CHUNK_SIZE, Enum.Material.Air)
+			built[item.key] = nil
+			builtCount = builtCount - 1
+		end
+		return
+	end
+	local old = built[item.key]
+	if old and old.mat == state.material then return end
+	local y = state.topY - FILL_DEPTH / 2
+	local ok, e = pcall(terrain.FillBlock, terrain, CFrame.new(item.x, y, item.z), CHUNK_SIZE, state.material)
+	if ok then
+		if not old then builtCount = builtCount + 1 end
+		built[item.key] = { x = item.x, y = y, z = item.z, mat = state.material }
+		if state.needHide then
+			state.needHide = false
+			hideAll()
+		end
+	else
+		-- stop instead of repeating the same error every frame
+		state.active = false
+		announce = false
+		queue, qi = {}, 1
+		setStatus("Error: " .. tostring(e), C.bad)
+		warn("[TerrainGUI] " .. tostring(e))
+	end
+end
+
+local function beginBuild(label, wipe)
+	state.cleared = false
+	state.active = true
+	state.label = label
+	state.needHide = true
+	announce = true
+	if wipe then
+		pcall(function() terrain:Clear() end)
+		built, builtCount = {}, 0
+	end
+	dirty = true
+	planTimer = 1   -- plan on the very next frame
+	setStatus(label .. ": starting...", C.warn)
+end
+
+local function refreshAll(label)
+	for p in pairs(plates) do plates[p] = nil end
+	pcall(scan)
+	computeGround()
+	beginBuild(label, true)
 end
 
 -- Wipes terrain only. Baseplates are kept and made visible again.
 local function clearAll()
-	jobId = jobId + 1       -- cancels any build in progress
-	running = false
+	state.active = false
+	state.cleared = true
+	announce = false
+	queue, qi = {}, 1
+	built, builtCount = {}, 0
 	terrain:Clear()
-	filled = {}
-	state.lastMult = nil
-	for p in pairs(plates) do
-		if p ~= fakePlate then
-			if p.Parent then
-				local o = origTrans[p]
-				if o == nil or o > 0.9 then o = 0 end
-				p.Transparency = o
-				p.CanCollide = true
-			else
-				plates[p] = nil
-				plateTiles[p] = nil
-			end
+	restorePlates()
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+	if not state.active then return end
+
+	planTimer = planTimer + dt
+	if planTimer >= 0.25 then
+		planTimer = 0
+		local f = focusPoint()
+		if dirty or not lastFocus or flatDist(f, lastFocus) > 32 then
+			dirty = false
+			plan(f)
 		end
 	end
-end
+
+	if qi > #queue then
+		if announce then
+			announce = false
+			setStatus(state.label .. ": ready - ground grows as you move (" .. builtCount .. " chunks)", C.good)
+		end
+		return
+	end
+
+	local t0 = os.clock()
+	while qi <= #queue and os.clock() - t0 < BUDGET do
+		local item = queue[qi]
+		qi = qi + 1
+		processItem(item)
+		if not state.active then return end
+	end
+
+	if announce and qi <= #queue then
+		statusTimer = statusTimer + dt
+		if statusTimer > 0.2 then
+			statusTimer = 0
+			setStatus(state.label .. ": building (" .. (#queue - qi + 1) .. " left)", C.warn)
+		end
+	end
+end))
 
 -- ============================================================
 -- BUTTONS
@@ -573,7 +585,6 @@ local function pick(i)
 	highlight(i)
 	local m = MATS[i]
 	if m.mat == nil then
-		state.cleared = true
 		local ok, e = pcall(clearAll)
 		if ok then
 			setStatus("Cleared terrain - baseplates kept", C.good)
@@ -581,10 +592,12 @@ local function pick(i)
 			setStatus("Error: " .. tostring(e), C.bad)
 		end
 	else
-		state.cleared = false
 		state.material = m.mat
-		pcall(function() terrain:SetMaterialColor(m.mat, m.color) end)
-		startJob(m.label)
+		pcall(function()
+			terrain.Decoration = state.decor
+			terrain:SetMaterialColor(m.mat, m.color)
+		end)
+		beginBuild(m.label, false)
 	end
 end
 
@@ -593,21 +606,18 @@ for i = 1, #MATS do
 end
 
 track(refreshBtn.Activated:Connect(function()
-	-- forget everything and rebuild from a fresh scan
-	for p in pairs(plates) do plates[p] = nil end
-	plateTiles = {}
-	fakePlate = nil
 	if MATS[selectedIdx].mat == nil then
+		for p in pairs(plates) do plates[p] = nil end
 		pcall(scan)
+		computeGround()
 		setStatus("Rescanned - pick a material to build", C.warn)
 	else
-		state.cleared = false
-		startJob(MATS[selectedIdx].label, { forceClear = true })
+		refreshAll(MATS[selectedIdx].label)
 	end
 end))
 
 local function refreshDecorText()
-	decorBtn.Text = "Decor: " .. (state.decor and "On" or "Off")
+	decorBtn.Text = "Blades: " .. (state.decor and "On" or "Off")
 end
 refreshDecorText()
 track(decorBtn.Activated:Connect(function()
@@ -620,15 +630,16 @@ end))
 -- SLIDER + WINDOW DRAG + COLLAPSE (mouse and touch)
 -- ============================================================
 
-local SMIN, SMAX = 0.25, 3.0
 local function setSlider(n)
 	n = math.clamp(n, 0, 1)
 	sliderFill.Size = UDim2.new(n, 0, 1, 0)
 	knob.Position = UDim2.new(n, 0, 0.5, 0)
-	state.mult = SMIN + n * (SMAX - SMIN)
-	sizeVal.Text = string.format("%.2fx", state.mult)
+	local r = RMIN + n * (RMAX - RMIN)
+	state.range = math.floor(r / 64 + 0.5) * 64
+	rangeVal.Text = tostring(state.range)
+	dirty = true
 end
-setSlider((1.0 - SMIN) / (SMAX - SMIN))
+setSlider((DEFAULT_RANGE - RMIN) / (RMAX - RMIN))
 
 local function isPress(i)
 	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
@@ -637,12 +648,11 @@ local function isMove(i)
 	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
 end
 
-local sliding, slideMoved = false, false
+local sliding = false
 local function slideTo(x)
 	local ap, as = sliderTrack.AbsolutePosition, sliderTrack.AbsoluteSize
 	if as.X > 0 then
 		setSlider((x - ap.X) / as.X)
-		slideMoved = true
 	end
 end
 local function startSlide(i)
@@ -708,17 +718,10 @@ end))
 
 track(UIS.InputEnded:Connect(function(i)
 	if not isPress(i) then return end
+	sliding = false
 	if dStart then
 		dStart = nil
 		clampToScreen()
-	end
-	if sliding then
-		sliding = false
-		-- letting go of the slider rebuilds at the new size
-		if slideMoved and not state.cleared then
-			startJob(MATS[selectedIdx].label)
-		end
-		slideMoved = false
 	end
 end))
 
@@ -731,41 +734,24 @@ track(colBtn.Activated:Connect(function()
 end))
 
 -- ============================================================
--- KEEP TERRAIN FOLLOWING YOU + PICK UP NEW BASEPLATES
+-- NEW BASEPLATES (streaming / respawned maps)
 -- ============================================================
-
-local acc = 0
-track(RunService.Heartbeat:Connect(function(dt)
-	acc = acc + dt
-	if acc < 0.4 then return end
-	acc = 0
-	if running or state.cleared or not applied.mat then return end
-	local f = focusPoint()
-	if dirty or not lastFocus or flatDist(f, lastFocus) > FOLLOW_STEP then
-		dirty = false
-		startJob("Auto", { topUp = true })
-	end
-end))
 
 track(workspace.DescendantAdded:Connect(function(d)
 	if not d:IsA("BasePart") then return end
 	local s = d.Size
 	if not (s.X > 100 or s.Z > 100 or nameLooksLikeFloor(d.Name)) then return end
 	task.delay(0.3, function()
-		if state.cleared or plates[d] or not d.Parent then return end
-		if isBaseplate(d) then
-			if fakePlate then
-				-- a real baseplate showed up, so replace the stand-in floor
-				plates[fakePlate] = nil
-				plateTiles[fakePlate] = nil
-				fakePlate = nil
-				state.needClear = true
-				plates[d] = true
-				startJob("Auto")
-			else
-				plates[d] = true
-				dirty = true
-			end
+		if plates[d] or not d.Parent then return end
+		if not isBaseplate(d) then return end
+		plates[d] = true
+		if state.cleared then return end
+		if not state.hadPlate then
+			-- the game's real baseplate just loaded, so rebuild at its height
+			computeGround()
+			beginBuild(state.label, true)
+		elseif state.active and not state.needHide then
+			pcall(hide, d)
 		end
 	end)
 end))
@@ -779,5 +765,7 @@ pcall(function()
 	terrain.Decoration = state.decor
 	terrain:SetMaterialColor(MATS[1].mat, MATS[1].color)
 end)
-startJob("Grass")
+pcall(scan)
+computeGround()
+beginBuild("Grass", true)
 print("[TerrainGUI] Loaded")
