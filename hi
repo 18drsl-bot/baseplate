@@ -53,7 +53,7 @@ local FOLLOW_STEP = RADIUS * 0.3           -- move this far and new tiles get bu
 -- ============================================================
 
 local MATS = {
-	{ label = "Grass",          mat = Enum.Material.Grass,    color = Color3.fromRGB(90, 130, 60)   },
+	{ label = "Grass",          mat = Enum.Material.Grass,    color = Color3.fromRGB(106, 190, 64)  },  -- bright, lush green
 	{ label = "Smooth Plastic", mat = Enum.Material.Concrete, color = Color3.fromRGB(185, 183, 180) },
 	{ label = "Plastic",        mat = Enum.Material.Pavement, color = Color3.fromRGB(170, 168, 165) },
 	{ label = "Sand",           mat = Enum.Material.Sand,     color = Color3.fromRGB(198, 172, 120) },
@@ -69,7 +69,7 @@ local state = {
 	material = Enum.Material.Grass,
 	mult = 1,
 	cleared = false,
-	decor = not isTouch,   -- grass blades cost performance, so they start off on mobile
+	decor = true,          -- grass blades give the lush look; turn off with the Decor button if it lags
 	needClear = true,
 	lastMult = nil,
 	lastMat = nil,
