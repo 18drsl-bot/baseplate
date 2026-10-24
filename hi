@@ -1,436 +1,545 @@
--- Terrain Converter GUI
--- Place as a LocalScript in StarterPlayerScripts
+-- Terrain Converter GUI (Blue)
+-- Run as an executor script, or as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
+local terrain = workspace:WaitForChild("Terrain")
+
+local env = (getgenv and getgenv()) or _G
 
 -- ============================================================
--- BUILD GUI FIRST (before any terrain ops that might error)
+-- CLEAN UP A PREVIOUS RUN
 -- ============================================================
 
-local sg = Instance.new("ScreenGui")
-sg.Name = "TerrainGUI"
-sg.ResetOnSpawn = false
-sg.IgnoreGuiInset = true
-sg.Enabled = true
-sg.Parent = PlayerGui
+if env.TerrainGUIConns then
+	for _, c in ipairs(env.TerrainGUIConns) do
+		pcall(function() c:Disconnect() end)
+	end
+end
+env.TerrainGUIConns = {}
+if env.TerrainAutoConverter then
+	pcall(function() env.TerrainAutoConverter:Disconnect() end)
+	env.TerrainAutoConverter = nil
+end
+local oldGui = PlayerGui:FindFirstChild("TerrainGUI")
+if oldGui then oldGui:Destroy() end
 
-local W = 230
+local function track(conn)
+	table.insert(env.TerrainGUIConns, conn)
+	return conn
+end
 
--- Main frame
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Size = UDim2.new(0, W, 0, 300)
-main.Position = UDim2.new(1, -(W + 10), 0, 10)
-main.BackgroundColor3 = Color3.fromRGB(10, 20, 45)
-main.BorderSizePixel = 0
-main.Active = true
-main.Parent = sg
+-- Remembers each baseplate's real transparency (survives re-running the script)
+env.TerrainOrigTrans = env.TerrainOrigTrans or setmetatable({}, { __mode = "k" })
+local origTrans = env.TerrainOrigTrans
 
-local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(0,10); mc.Parent = main
-local ms = Instance.new("UIStroke"); ms.Color = Color3.fromRGB(50,100,200); ms.Thickness = 1; ms.Parent = main
+-- ============================================================
+-- MATERIALS (all are real terrain materials, so FillBlock works)
+-- ============================================================
 
--- Title bar
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 36)
-titleBar.BackgroundColor3 = Color3.fromRGB(20, 50, 100)
-titleBar.BorderSizePixel = 0
-titleBar.Parent = main
-local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(0,10); tc.Parent = titleBar
--- Fill bottom corners of title bar
-local tf = Instance.new("Frame")
-tf.Size = UDim2.new(1,0,0,12)
-tf.Position = UDim2.new(0,0,1,-12)
-tf.BackgroundColor3 = Color3.fromRGB(20,50,100)
-tf.BorderSizePixel = 0
-tf.Parent = titleBar
-
-local titleLbl = Instance.new("TextLabel")
-titleLbl.Size = UDim2.new(1,-40,1,0)
-titleLbl.Position = UDim2.new(0,10,0,0)
-titleLbl.BackgroundTransparency = 1
-titleLbl.Text = "Terrain Converter"
-titleLbl.TextColor3 = Color3.fromRGB(200,225,255)
-titleLbl.Font = Enum.Font.GothamBold
-titleLbl.TextSize = 13
-titleLbl.TextXAlignment = Enum.TextXAlignment.Left
-titleLbl.Parent = titleBar
-
-local colBtn = Instance.new("TextButton")
-colBtn.Size = UDim2.new(0,24,0,24)
-colBtn.Position = UDim2.new(1,-30,0,6)
-colBtn.BackgroundColor3 = Color3.fromRGB(30,60,120)
-colBtn.BorderSizePixel = 0
-colBtn.Text = "-"
-colBtn.TextColor3 = Color3.fromRGB(200,225,255)
-colBtn.Font = Enum.Font.GothamBold
-colBtn.TextSize = 16
-colBtn.Parent = titleBar
-local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0,6); cc.Parent = colBtn
-
--- Content frame
-local content = Instance.new("Frame")
-content.Name = "Content"
-content.Size = UDim2.new(1,0,1,-36)
-content.Position = UDim2.new(0,0,0,36)
-content.BackgroundTransparency = 1
-content.Parent = main
-
-local P = 10  -- padding
-
--- Size label row
-local sizeLbl = Instance.new("TextLabel")
-sizeLbl.Size = UDim2.new(1,-P*2,0,14)
-sizeLbl.Position = UDim2.new(0,P,0,8)
-sizeLbl.BackgroundTransparency = 1
-sizeLbl.Text = "TERRAIN SIZE"
-sizeLbl.TextColor3 = Color3.fromRGB(100,150,220)
-sizeLbl.Font = Enum.Font.Gotham
-sizeLbl.TextSize = 10
-sizeLbl.TextXAlignment = Enum.TextXAlignment.Left
-sizeLbl.Parent = content
-
-local sizeVal = Instance.new("TextLabel")
-sizeVal.Size = UDim2.new(0,50,0,14)
-sizeVal.Position = UDim2.new(1,-P-50,0,8)
-sizeVal.BackgroundTransparency = 1
-sizeVal.Text = "1.00x"
-sizeVal.TextColor3 = Color3.fromRGB(200,225,255)
-sizeVal.Font = Enum.Font.GothamBold
-sizeVal.TextSize = 11
-sizeVal.TextXAlignment = Enum.TextXAlignment.Right
-sizeVal.Parent = content
-
--- Slider track
-local TW = W - P*2
-local track = Instance.new("Frame")
-track.Size = UDim2.new(0,TW,0,6)
-track.Position = UDim2.new(0,P,0,30)
-track.BackgroundColor3 = Color3.fromRGB(25,45,90)
-track.BorderSizePixel = 0
-track.Parent = content
-local trc = Instance.new("UICorner"); trc.CornerRadius = UDim.new(1,0); trc.Parent = track
-
-local sliderFill = Instance.new("Frame")
-sliderFill.Size = UDim2.new(0.275,0,1,0)
-sliderFill.BackgroundColor3 = Color3.fromRGB(50,120,230)
-sliderFill.BorderSizePixel = 0
-sliderFill.Parent = track
-local sfc = Instance.new("UICorner"); sfc.CornerRadius = UDim.new(1,0); sfc.Parent = sliderFill
-
-local knob = Instance.new("TextButton")
-knob.Size = UDim2.new(0,16,0,16)
-knob.AnchorPoint = Vector2.new(0.5,0.5)
-knob.Position = UDim2.new(0.275,0,0.5,0)
-knob.BackgroundColor3 = Color3.fromRGB(180,210,255)
-knob.BorderSizePixel = 0
-knob.Text = ""
-knob.ZIndex = 5
-knob.Parent = track
-local kc = Instance.new("UICorner"); kc.CornerRadius = UDim.new(1,0); kc.Parent = knob
-
--- Material label
-local matLbl = Instance.new("TextLabel")
-matLbl.Size = UDim2.new(1,-P*2,0,14)
-matLbl.Position = UDim2.new(0,P,0,50)
-matLbl.BackgroundTransparency = 1
-matLbl.Text = "MATERIAL"
-matLbl.TextColor3 = Color3.fromRGB(100,150,220)
-matLbl.Font = Enum.Font.Gotham
-matLbl.TextSize = 10
-matLbl.TextXAlignment = Enum.TextXAlignment.Left
-matLbl.Parent = content
-
--- Material buttons
--- NOTE: Only terrain-compatible materials work with FillBlock.
--- Plastic/SmoothPlastic/DiamondPlate are part-only materials and will silently fail.
--- We remap them to the closest-looking valid terrain materials:
---   Smooth Plastic -> Concrete  (smooth light-grey surface)
---   Plastic        -> Pavement  (flat grey)
---   Diamond        -> Glacier   (shiny/reflective)
 local MATS = {
-	{label="Grass",         mat=Enum.Material.Grass,     color=Color3.fromRGB(90,130,60)},
-	{label="Smooth Plastic",mat=Enum.Material.Concrete,  color=Color3.fromRGB(185,183,180)},
-	{label="Plastic",       mat=Enum.Material.Pavement,  color=Color3.fromRGB(170,168,165)},
-	{label="Sand",          mat=Enum.Material.Sand,       color=Color3.fromRGB(198,172,120)},
-	{label="Clear",         mat=nil,                      color=Color3.fromRGB(100,180,220)},
-	{label="Diamond",       mat=Enum.Material.Glacier,    color=Color3.fromRGB(200,225,240)},
+	{ label = "Grass",          mat = Enum.Material.Grass,    color = Color3.fromRGB(90, 130, 60)   },
+	{ label = "Smooth Plastic", mat = Enum.Material.Concrete, color = Color3.fromRGB(185, 183, 180) },
+	{ label = "Plastic",        mat = Enum.Material.Pavement, color = Color3.fromRGB(170, 168, 165) },
+	{ label = "Sand",           mat = Enum.Material.Sand,     color = Color3.fromRGB(198, 172, 120) },
+	{ label = "Clear",          mat = nil,                    color = Color3.fromRGB(100, 180, 220) },
+	{ label = "Diamond",        mat = Enum.Material.Glacier,  color = Color3.fromRGB(200, 225, 240) },
 }
 
-local BW = (TW - 6) / 2
-local BH = 28
-local BY = 68
+-- ============================================================
+-- GUI
+-- ============================================================
+
+local C = {
+	bg      = Color3.fromRGB(10, 20, 45),
+	title   = Color3.fromRGB(20, 50, 100),
+	border  = Color3.fromRGB(50, 100, 200),
+	btn     = Color3.fromRGB(20, 40, 85),
+	btnSel  = Color3.fromRGB(40, 90, 200),
+	btnText = Color3.fromRGB(120, 160, 220),
+	text    = Color3.fromRGB(200, 225, 255),
+	sub     = Color3.fromRGB(100, 150, 220),
+	track   = Color3.fromRGB(25, 45, 90),
+	fill    = Color3.fromRGB(50, 120, 230),
+	knob    = Color3.fromRGB(180, 210, 255),
+	accent  = Color3.fromRGB(35, 90, 200),
+	good    = Color3.fromRGB(60, 200, 120),
+	warn    = Color3.fromRGB(240, 190, 70),
+	bad     = Color3.fromRGB(240, 100, 100),
+}
+
+local function make(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(parent, r)
+	return make("UICorner", { CornerRadius = UDim.new(0, r) }, parent)
+end
+local function outline(parent, color)
+	return make("UIStroke", { Color = color, Thickness = 1 }, parent)
+end
+
+local W, P, TH = 230, 10, 36
+local TW = W - P * 2
+
+local sg = make("ScreenGui", {
+	Name = "TerrainGUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, PlayerGui)
+
+local main = make("Frame", {
+	Name = "Main",
+	Size = UDim2.new(0, W, 0, 281),
+	Position = UDim2.new(1, -(W + 10), 0, 10),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel = 0,
+	Active = true,
+}, sg)
+round(main, 10)
+outline(main, C.border)
+
+local titleBar = make("Frame", {
+	Size = UDim2.new(1, 0, 0, TH),
+	BackgroundColor3 = C.title,
+	BorderSizePixel = 0,
+}, main)
+round(titleBar, 10)
+make("Frame", {
+	Size = UDim2.new(1, 0, 0, 12),
+	Position = UDim2.new(0, 0, 1, -12),
+	BackgroundColor3 = C.title,
+	BorderSizePixel = 0,
+}, titleBar)
+make("TextLabel", {
+	Size = UDim2.new(1, -40, 1, 0),
+	Position = UDim2.new(0, 10, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "Terrain Converter",
+	TextColor3 = C.text,
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+
+local colBtn = make("TextButton", {
+	Size = UDim2.new(0, 24, 0, 24),
+	Position = UDim2.new(1, -30, 0, 6),
+	BackgroundColor3 = Color3.fromRGB(30, 60, 120),
+	BorderSizePixel = 0,
+	Text = "-",
+	TextColor3 = C.text,
+	Font = Enum.Font.GothamBold,
+	TextSize = 16,
+}, titleBar)
+round(colBtn, 6)
+
+local content = make("Frame", {
+	Name = "Content",
+	Size = UDim2.new(1, 0, 1, -TH),
+	Position = UDim2.new(0, 0, 0, TH),
+	BackgroundTransparency = 1,
+}, main)
+
+make("TextLabel", {
+	Size = UDim2.new(1, -P * 2, 0, 14),
+	Position = UDim2.new(0, P, 0, 8),
+	BackgroundTransparency = 1,
+	Text = "TERRAIN SIZE",
+	TextColor3 = C.sub,
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, content)
+
+local sizeVal = make("TextLabel", {
+	Size = UDim2.new(0, 50, 0, 14),
+	Position = UDim2.new(1, -P - 50, 0, 8),
+	BackgroundTransparency = 1,
+	Text = "1.00x",
+	TextColor3 = C.text,
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+}, content)
+
+local sliderTrack = make("Frame", {
+	Size = UDim2.new(0, TW, 0, 8),
+	Position = UDim2.new(0, P, 0, 29),
+	BackgroundColor3 = C.track,
+	BorderSizePixel = 0,
+}, content)
+round(sliderTrack, 4)
+
+local sliderFill = make("Frame", {
+	Size = UDim2.new(0.27, 0, 1, 0),
+	BackgroundColor3 = C.fill,
+	BorderSizePixel = 0,
+}, sliderTrack)
+round(sliderFill, 4)
+
+local knob = make("TextButton", {
+	Size = UDim2.new(0, 16, 0, 16),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0.27, 0, 0.5, 0),
+	BackgroundColor3 = C.knob,
+	BorderSizePixel = 0,
+	Text = "",
+	ZIndex = 5,
+}, sliderTrack)
+round(knob, 8)
+
+make("TextLabel", {
+	Size = UDim2.new(1, -P * 2, 0, 14),
+	Position = UDim2.new(0, P, 0, 50),
+	BackgroundTransparency = 1,
+	Text = "MATERIAL",
+	TextColor3 = C.sub,
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, content)
+
+local BW, BH, BY = (TW - 6) / 2, 28, 68
 local matBtns = {}
-local selectedIdx = 1
-
 for i, m in ipairs(MATS) do
-	local col = (i-1) % 2
-	local row = math.floor((i-1)/2)
-	local btn = Instance.new("TextButton")
-	btn.Size = UDim2.new(0, BW, 0, BH)
-	btn.Position = UDim2.new(0, P + col*(BW+6), 0, BY + row*(BH+5))
-	btn.BackgroundColor3 = Color3.fromRGB(20,40,85)
-	btn.BorderSizePixel = 0
-	btn.Text = m.label
-	btn.TextColor3 = Color3.fromRGB(120,160,220)
-	btn.Font = Enum.Font.Gotham
-	btn.TextSize = 11
-	btn.ClipsDescendants = true
-	btn.Parent = content
-	local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0,6); bc.Parent = btn
-	local bs = Instance.new("UIStroke"); bs.Color = Color3.fromRGB(35,70,140); bs.Thickness = 1; bs.Parent = btn
-	table.insert(matBtns, btn)
+	local col = (i - 1) % 2
+	local row = math.floor((i - 1) / 2)
+	local b = make("TextButton", {
+		Size = UDim2.new(0, BW, 0, BH),
+		Position = UDim2.new(0, P + col * (BW + 6), 0, BY + row * (BH + 5)),
+		BackgroundColor3 = C.btn,
+		BorderSizePixel = 0,
+		Text = m.label,
+		TextColor3 = C.btnText,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+	}, content)
+	round(b, 6)
+	outline(b, Color3.fromRGB(35, 70, 140))
+	matBtns[i] = b
 end
 
-local function selectBtn(i)
-	if matBtns[selectedIdx] then
-		matBtns[selectedIdx].BackgroundColor3 = Color3.fromRGB(20,40,85)
-		matBtns[selectedIdx].TextColor3 = Color3.fromRGB(120,160,220)
-	end
-	selectedIdx = i
-	matBtns[i].BackgroundColor3 = Color3.fromRGB(40,90,200)
-	matBtns[i].TextColor3 = Color3.fromRGB(220,235,255)
+local applyY = BY + 3 * (BH + 5) + 4
+local applyBtn = make("TextButton", {
+	Size = UDim2.new(0, TW, 0, 32),
+	Position = UDim2.new(0, P, 0, applyY),
+	BackgroundColor3 = C.accent,
+	BorderSizePixel = 0,
+	Text = "Apply / Rescan",
+	TextColor3 = Color3.fromRGB(220, 240, 255),
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+}, content)
+round(applyBtn, 7)
+
+local statusLbl = make("TextLabel", {
+	Size = UDim2.new(0, TW, 0, 28),
+	Position = UDim2.new(0, P, 0, applyY + 38),
+	BackgroundTransparency = 1,
+	Text = "Starting...",
+	TextColor3 = C.good,
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+	TextWrapped = true,
+	TextYAlignment = Enum.TextYAlignment.Top,
+}, content)
+
+local fullH = TH + applyY + 74
+main.Size = UDim2.new(0, W, 0, fullH)
+
+local function setStatus(text, color)
+	statusLbl.Text = text
+	statusLbl.TextColor3 = color or C.good
 end
 
-selectBtn(1)
-
--- Apply button
-local applyY = BY + 3*(BH+5) + 4
-local applyBtn = Instance.new("TextButton")
-applyBtn.Size = UDim2.new(0, TW, 0, 32)
-applyBtn.Position = UDim2.new(0, P, 0, applyY)
-applyBtn.BackgroundColor3 = Color3.fromRGB(35,90,200)
-applyBtn.BorderSizePixel = 0
-applyBtn.Text = "Apply / Reapply"
-applyBtn.TextColor3 = Color3.fromRGB(220,240,255)
-applyBtn.Font = Enum.Font.GothamBold
-applyBtn.TextSize = 13
-applyBtn.Parent = content
-local abc = Instance.new("UICorner"); abc.CornerRadius = UDim.new(0,7); abc.Parent = applyBtn
-
--- Status
-local statusLbl = Instance.new("TextLabel")
-statusLbl.Size = UDim2.new(1,0,0,14)
-statusLbl.Position = UDim2.new(0,0,0,applyY+38)
-statusLbl.BackgroundTransparency = 1
-statusLbl.Text = "Auto-conversion active"
-statusLbl.TextColor3 = Color3.fromRGB(60,200,120)
-statusLbl.Font = Enum.Font.Gotham
-statusLbl.TextSize = 10
-statusLbl.TextXAlignment = Enum.TextXAlignment.Center
-statusLbl.Parent = content
-
--- Fit frame height
-main.Size = UDim2.new(0, W, 0, 36 + applyY + 54)
-
 -- ============================================================
--- TERRAIN FUNCTIONS  (cached baseplates = no per-click scanning)
+-- TERRAIN LOGIC
 -- ============================================================
 
-local currentMaterial = Enum.Material.Grass
-local currentMult = 1.0
+local state = { material = Enum.Material.Grass, mult = 1, cleared = false }
+local plates = {}            -- set of baseplate parts: part -> true
+local MIN_THICK = 8          -- thin baseplates still get a visible terrain layer
+local CHUNK = 1024           -- big baseplates are filled in pieces so FillBlock never fails
+local DROP = 2.5             -- terrain top sits this far below the baseplate surface
 
--- Cache of found baseplates so clicks never re-scan the workspace
-local cachedPlates = {}
+local function nameLooksLikeFloor(name)
+	local n = string.lower(name)
+	return string.find(n, "baseplate", 1, true) ~= nil
+		or string.find(n, "floor", 1, true) ~= nil
+		or string.find(n, "ground", 1, true) ~= nil
+end
 
 local function isBaseplate(p)
-	if not p:IsA("BasePart") then return false end
+	if not p:IsA("BasePart") or p:IsA("Terrain") then return false end
 	if not p.CanCollide and p.Transparency == 1 then return false end
-	local n = string.lower(p.Name)
-	local named = string.find(n,"baseplate") or string.find(n,"floor") or string.find(n,"ground")
-	local flat = math.abs(p.CFrame.UpVector.Y) > 0.9
-	return ((p.Size.X > 100 and p.Size.Z > 100) or named) and p.Size.Y < 20 and flat
+	local s = p.Size
+	if s.Y > 50 then return false end
+	if math.abs(p.CFrame.UpVector.Y) < 0.9 then return false end
+	return (s.X > 100 and s.Z > 100) or nameLooksLikeFloor(p.Name)
 end
 
--- Scan once and store results
-local function buildCache()
-	cachedPlates = {}
-	for _, p in ipairs(workspace:GetDescendants()) do
-		if isBaseplate(p) then
-			table.insert(cachedPlates, p)
+local function fillBox(cf, size, material)
+	local nx = math.max(1, math.ceil(size.X / CHUNK))
+	local nz = math.max(1, math.ceil(size.Z / CHUNK))
+	local cx, cz = size.X / nx, size.Z / nz
+	for ix = 0, nx - 1 do
+		for iz = 0, nz - 1 do
+			local ox = -size.X / 2 + cx * (ix + 0.5)
+			local oz = -size.Z / 2 + cz * (iz + 0.5)
+			terrain:FillBlock(cf * CFrame.new(ox, 0, oz), Vector3.new(cx, size.Y, cz), material)
 		end
 	end
 end
 
--- Fill terrain from cache — fast, no scanning
-local function applyFromCache()
-	pcall(function() workspace.Terrain:Clear() end)
-	if #cachedPlates == 0 then
-		-- Fallback flat fill
-		pcall(function()
-			workspace.Terrain:FillBlock(
-				CFrame.new(0,-2,0),
-				Vector3.new(2000*currentMult, 4, 2000*currentMult),
-				currentMaterial
-			)
-		end)
-		return
+local function fillPlate(p)
+	local s = p.Size
+	local th = math.max(s.Y, MIN_THICK)
+	local localY = (s.Y / 2 - DROP) - th / 2
+	fillBox(
+		p.CFrame * CFrame.new(0, localY, 0),
+		Vector3.new(s.X * state.mult, th, s.Z * state.mult),
+		state.material
+	)
+end
+
+-- Baseplate becomes invisible but stays solid, so walking height stays exact
+local function hide(p)
+	if origTrans[p] == nil then origTrans[p] = p.Transparency end
+	p.Transparency = 1
+	p.CanCollide = true
+end
+
+local function scan()
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if isBaseplate(d) then plates[d] = true end
 	end
-	for _, p in ipairs(cachedPlates) do
-		if p and p.Parent then
-			pcall(function()
-				local s = p.Size
-				workspace.Terrain:FillBlock(
-					p.CFrame * CFrame.new(0,-2.5,0),
-					Vector3.new(s.X*currentMult, s.Y, s.Z*currentMult),
-					currentMaterial
-				)
-				p.Transparency = 1
-				p.CanCollide = true
-			end)
+end
+
+local function fillKnown()
+	local n, err = 0, nil
+	for p in pairs(plates) do
+		if p.Parent then
+			local ok, e = pcall(fillPlate, p)
+			if ok then
+				hide(p)
+				n = n + 1
+			else
+				err = err or tostring(e)
+			end
+		else
+			plates[p] = nil
+		end
+	end
+	return n, err
+end
+
+-- returns: plateCount, firstError, usedFallback
+local function applyAll()
+	terrain:Clear()
+	local n, err = fillKnown()
+	if n == 0 then
+		scan()
+		n, err = fillKnown()
+	end
+	if n == 0 then
+		fillBox(CFrame.new(0, -2, 0), Vector3.new(2000 * state.mult, 4, 2000 * state.mult), state.material)
+		return 0, err, true
+	end
+	return n, err, false
+end
+
+-- Wipes terrain only. Baseplates are kept and made visible again.
+local function clearAll()
+	terrain:Clear()
+	for p in pairs(plates) do
+		if p.Parent then
+			local o = origTrans[p]
+			if o == nil or o > 0.9 then o = 0 end
+			p.Transparency = o
+			p.CanCollide = true
+		else
+			plates[p] = nil
 		end
 	end
 end
 
-local function clearOnly()
-	pcall(function() workspace.Terrain:Clear() end)
-	for _, p in ipairs(cachedPlates) do
-		if p and p.Parent then
-			p.Transparency = 0
-		end
+local function runApply(label)
+	local ok, a, b, c = pcall(applyAll)
+	if not ok then
+		setStatus("Error: " .. tostring(a), C.bad)
+		warn("[TerrainGUI] " .. tostring(a))
+	elseif c then
+		setStatus(label .. ": no baseplate found, used flat fill", C.warn)
+	elseif b then
+		setStatus(label .. ": " .. a .. " plate(s) done, some failed", C.warn)
+		warn("[TerrainGUI] " .. tostring(b))
+	else
+		setStatus(label .. ": applied to " .. a .. " baseplate(s)", C.good)
 	end
-end
-
--- Full rescan + apply (used on init and when new big parts appear)
-local function reapply()
-	buildCache()
-	applyFromCache()
 end
 
 -- ============================================================
--- SLIDER LOGIC
+-- BUTTONS
+-- ============================================================
+
+local selectedIdx = 1
+local function highlight(i)
+	matBtns[selectedIdx].BackgroundColor3 = C.btn
+	matBtns[selectedIdx].TextColor3 = C.btnText
+	selectedIdx = i
+	matBtns[i].BackgroundColor3 = C.btnSel
+	matBtns[i].TextColor3 = C.text
+end
+
+local function pick(i)
+	highlight(i)
+	local m = MATS[i]
+	if m.mat == nil then
+		state.cleared = true
+		local ok, e = pcall(clearAll)
+		if ok then
+			setStatus("Cleared terrain - baseplates kept", C.good)
+		else
+			setStatus("Error: " .. tostring(e), C.bad)
+		end
+	else
+		state.cleared = false
+		state.material = m.mat
+		pcall(function()
+			terrain.Decoration = (m.mat == Enum.Material.Grass)
+			terrain:SetMaterialColor(m.mat, m.color)
+		end)
+		runApply(m.label)
+	end
+end
+
+for i = 1, #MATS do
+	track(matBtns[i].MouseButton1Click:Connect(function() pick(i) end))
+end
+
+track(applyBtn.MouseButton1Click:Connect(function()
+	for p in pairs(plates) do plates[p] = nil end
+	pcall(scan)
+	if MATS[selectedIdx].mat == nil then
+		setStatus("Rescanned - pick a material to apply", C.warn)
+	else
+		runApply(MATS[selectedIdx].label)
+	end
+end))
+
+-- ============================================================
+-- SLIDER + WINDOW DRAG + COLLAPSE
 -- ============================================================
 
 local SMIN, SMAX = 0.25, 3.0
-local snorm = (1.0 - SMIN) / (SMAX - SMIN)
-
 local function setSlider(n)
 	n = math.clamp(n, 0, 1)
-	snorm = n
 	sliderFill.Size = UDim2.new(n, 0, 1, 0)
 	knob.Position = UDim2.new(n, 0, 0.5, 0)
-	currentMult = SMIN + n * (SMAX - SMIN)
-	sizeVal.Text = string.format("%.2fx", currentMult)
+	state.mult = SMIN + n * (SMAX - SMIN)
+	sizeVal.Text = string.format("%.2fx", state.mult)
+end
+setSlider((1.0 - SMIN) / (SMAX - SMIN))
+
+local sliding, slideMoved = false, false
+local function slideTo(x)
+	local ap, as = sliderTrack.AbsolutePosition, sliderTrack.AbsoluteSize
+	if as.X > 0 then
+		setSlider((x - ap.X) / as.X)
+		slideMoved = true
+	end
 end
 
-setSlider(snorm)
-
-local dragging = false
-knob.MouseButton1Down:Connect(function() dragging = true end)
-UIS.InputEnded:Connect(function(i)
-	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-		dragging = false
-	end
-end)
-UIS.InputChanged:Connect(function(i)
-	if not dragging then return end
-	if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
-		local ap = track.AbsolutePosition
-		local as = track.AbsoluteSize
-		if as.X > 0 then
-			setSlider((i.Position.X - ap.X) / as.X)
-		end
-	end
-end)
-
--- ============================================================
--- BUTTON CLICKS
--- ============================================================
-
-for i, m in ipairs(MATS) do
-	matBtns[i].MouseButton1Click:Connect(function()
-		selectBtn(i)
-		if m.mat == nil then
-			-- Clear: wipe terrain, restore baseplate visibility
-			clearOnly()
-			workspace.Terrain.Decoration = false
-		else
-			-- Instant: just set material + fill from cache, no scanning
-			currentMaterial = m.mat
-			workspace.Terrain.Decoration = true
-			pcall(function() workspace.Terrain:SetMaterialColor(m.mat, m.color) end)
-			applyFromCache()
-		end
-	end)
+local function isPress(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+local function isMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
 end
 
-applyBtn.MouseButton1Click:Connect(function()
-	local m = MATS[selectedIdx]
-	if m.mat ~= nil then
-		currentMaterial = m.mat
-		workspace.Terrain.Decoration = true
-		pcall(function() workspace.Terrain:SetMaterialColor(m.mat, m.color) end)
-		applyFromCache()
+track(knob.MouseButton1Down:Connect(function() sliding = true end))
+track(sliderTrack.InputBegan:Connect(function(i)
+	if isPress(i) then
+		sliding = true
+		slideTo(i.Position.X)
 	end
-end)
-
--- ============================================================
--- COLLAPSE
--- ============================================================
-
-local collapsed = false
-local fullH = main.Size.Y.Offset
-
-colBtn.MouseButton1Click:Connect(function()
-	collapsed = not collapsed
-	content.Visible = not collapsed
-	colBtn.Text = collapsed and "+" or "-"
-	main.Size = UDim2.new(0, W, 0, collapsed and 36 or fullH)
-end)
-
--- ============================================================
--- DRAG
--- ============================================================
+end))
 
 local dStart, dPos
-titleBar.InputBegan:Connect(function(i)
-	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+track(titleBar.InputBegan:Connect(function(i)
+	if isPress(i) then
 		dStart = i.Position
 		dPos = main.Position
 	end
-end)
-titleBar.InputChanged:Connect(function(i)
-	if dStart and i.UserInputType == Enum.UserInputType.MouseMovement then
+end))
+
+track(UIS.InputChanged:Connect(function(i)
+	if not isMove(i) then return end
+	if sliding then
+		slideTo(i.Position.X)
+	elseif dStart then
 		local d = i.Position - dStart
-		main.Position = UDim2.new(dPos.X.Scale, dPos.X.Offset+d.X, dPos.Y.Scale, dPos.Y.Offset+d.Y)
+		main.Position = UDim2.new(dPos.X.Scale, dPos.X.Offset + d.X, dPos.Y.Scale, dPos.Y.Offset + d.Y)
 	end
-end)
-titleBar.InputEnded:Connect(function(i)
-	if i.UserInputType == Enum.UserInputType.MouseButton1 then dStart = nil end
-end)
+end))
 
--- ============================================================
--- AUTO-CONVERTER (rescans only when new big parts appear)
--- ============================================================
-
-if getgenv().TerrainAutoConverter then
-	getgenv().TerrainAutoConverter:Disconnect()
-end
-
-local autoDebounce = false
-getgenv().TerrainAutoConverter = workspace.DescendantAdded:Connect(function(p)
-	if not p:IsA("BasePart") then return end
-	local n = string.lower(p.Name)
-	local isFloor = string.find(n,"baseplate") or string.find(n,"floor") or string.find(n,"ground")
-	if isFloor or p.Size.X > 50 or p.Size.Z > 50 then
-		if not autoDebounce then
-			autoDebounce = true
-			task.delay(1.5, function()
-				if MATS[selectedIdx].mat ~= nil then
-					reapply()
-				end
-				autoDebounce = false
-			end)
+track(UIS.InputEnded:Connect(function(i)
+	if not isPress(i) then return end
+	dStart = nil
+	if sliding then
+		sliding = false
+		-- releasing the slider applies the new size right away
+		if slideMoved and not state.cleared then
+			runApply(MATS[selectedIdx].label)
 		end
+		slideMoved = false
 	end
+end))
+
+local collapsed = false
+track(colBtn.MouseButton1Click:Connect(function()
+	collapsed = not collapsed
+	content.Visible = not collapsed
+	colBtn.Text = collapsed and "+" or "-"
+	main.Size = UDim2.new(0, W, 0, collapsed and TH or fullH)
+end))
+
+-- ============================================================
+-- AUTO-CONVERT NEW / STREAMED-IN BASEPLATES (incremental, no rescan)
+-- ============================================================
+
+track(workspace.DescendantAdded:Connect(function(d)
+	if not d:IsA("BasePart") then return end
+	local s = d.Size
+	if not (s.X > 100 or s.Z > 100 or nameLooksLikeFloor(d.Name)) then return end
+	task.delay(0.3, function()
+		if state.cleared or plates[d] or not d.Parent then return end
+		if isBaseplate(d) then
+			plates[d] = true
+			local ok = pcall(function()
+				fillPlate(d)
+				hide(d)
+			end)
+			if not ok then plates[d] = nil end
+		end
+	end)
+end))
+
+-- ============================================================
+-- START
+-- ============================================================
+
+highlight(1)
+pcall(function()
+	terrain.Decoration = true
+	terrain:SetMaterialColor(MATS[1].mat, MATS[1].color)
 end)
-
--- ============================================================
--- INITIAL RUN (one scan on load, cache ready for all future clicks)
--- ============================================================
-
-pcall(function() workspace.Terrain:SetMaterialColor(Enum.Material.Grass, Color3.fromRGB(90,130,60)) end)
-reapply()
-print("[TerrainGUI] Loaded OK")
+pcall(scan)
+runApply("Grass")
+print("[TerrainGUI] Loaded")
