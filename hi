@@ -1,11 +1,13 @@
--- Terrain Converter GUI (Blue)
+-- Terrain Converter GUI (Blue) - mobile friendly, time-sliced fills
 -- Run as an executor script, or as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
 local terrain = workspace:WaitForChild("Terrain")
+local isTouch = UIS.TouchEnabled
 
 local env = (getgenv and getgenv()) or _G
 
@@ -36,6 +38,17 @@ env.TerrainOrigTrans = env.TerrainOrigTrans or setmetatable({}, { __mode = "k" }
 local origTrans = env.TerrainOrigTrans
 
 -- ============================================================
+-- SETTINGS
+-- ============================================================
+
+local TILE        = 256                    -- terrain is built in tiles this wide
+local FILL_DEPTH  = 8                      -- terrain layer thickness (baseplate stays solid below)
+local DROP        = 2.5                    -- terrain top sits this far below the baseplate surface
+local BUDGET      = 0.005                  -- max seconds of terrain work per frame
+local RADIUS      = isTouch and 1200 or 3000   -- only build terrain this close to you (it follows you)
+local FOLLOW_STEP = RADIUS * 0.3           -- move this far and new tiles get built
+
+-- ============================================================
 -- MATERIALS (all are real terrain materials, so FillBlock works)
 -- ============================================================
 
@@ -47,6 +60,28 @@ local MATS = {
 	{ label = "Clear",          mat = nil,                    color = Color3.fromRGB(100, 180, 220) },
 	{ label = "Diamond",        mat = Enum.Material.Glacier,  color = Color3.fromRGB(200, 225, 240) },
 }
+
+-- ============================================================
+-- STATE
+-- ============================================================
+
+local state = {
+	material = Enum.Material.Grass,
+	mult = 1,
+	cleared = false,
+	decor = not isTouch,   -- grass blades cost performance, so they start off on mobile
+	needClear = true,
+	lastMult = nil,
+	lastMat = nil,
+}
+local applied = {}         -- material + size of the last full apply
+local plates = {}          -- set of baseplate parts: part -> true
+local plateTiles = {}      -- plate -> { mult = n, list = { tiles } }
+local filled = {}          -- tile -> true once built with the current material
+local fakePlate = nil      -- stand-in used when the game has no baseplate
+local jobId, running = 0, false
+local lastFocus = nil
+local dirty = false
 
 -- ============================================================
 -- GUI
@@ -83,8 +118,25 @@ local function outline(parent, color)
 	return make("UIStroke", { Color = color, Thickness = 1 }, parent)
 end
 
-local W, P, TH = 230, 10, 36
-local TW = W - P * 2
+-- Bigger touch targets on phones / tablets
+local W   = isTouch and 250 or 230
+local P   = 10
+local TH  = isTouch and 42 or 36
+local TW  = W - P * 2
+local HIT = isTouch and 34 or 22
+local KS  = isTouch and 24 or 16
+local BH  = isTouch and 38 or 28
+local GAP = isTouch and 6 or 5
+local AH  = isTouch and 40 or 32
+local FS  = isTouch and 12 or 11
+local CB  = isTouch and 32 or 24
+
+local hitY      = 24
+local matLabelY = hitY + HIT + 6
+local BY        = matLabelY + 18
+local applyY    = BY + 3 * (BH + GAP) + 4
+local statusY   = applyY + AH + 6
+local fullH     = TH + statusY + 32 + 6
 
 local sg = make("ScreenGui", {
 	Name = "TerrainGUI",
@@ -95,7 +147,7 @@ local sg = make("ScreenGui", {
 
 local main = make("Frame", {
 	Name = "Main",
-	Size = UDim2.new(0, W, 0, 281),
+	Size = UDim2.new(0, W, 0, fullH),
 	Position = UDim2.new(1, -(W + 10), 0, 10),
 	BackgroundColor3 = C.bg,
 	BorderSizePixel = 0,
@@ -103,6 +155,9 @@ local main = make("Frame", {
 }, sg)
 round(main, 10)
 outline(main, C.border)
+
+-- Shrinks the whole window on small screens so it always fits
+local uiScale = make("UIScale", { Scale = 1 }, main)
 
 local titleBar = make("Frame", {
 	Size = UDim2.new(1, 0, 0, TH),
@@ -117,25 +172,25 @@ make("Frame", {
 	BorderSizePixel = 0,
 }, titleBar)
 make("TextLabel", {
-	Size = UDim2.new(1, -40, 1, 0),
+	Size = UDim2.new(1, -(CB + 16), 1, 0),
 	Position = UDim2.new(0, 10, 0, 0),
 	BackgroundTransparency = 1,
 	Text = "Terrain Converter",
 	TextColor3 = C.text,
 	Font = Enum.Font.GothamBold,
-	TextSize = 13,
+	TextSize = isTouch and 14 or 13,
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, titleBar)
 
 local colBtn = make("TextButton", {
-	Size = UDim2.new(0, 24, 0, 24),
-	Position = UDim2.new(1, -30, 0, 6),
+	Size = UDim2.new(0, CB, 0, CB),
+	Position = UDim2.new(1, -(CB + 6), 0.5, -CB / 2),
 	BackgroundColor3 = Color3.fromRGB(30, 60, 120),
 	BorderSizePixel = 0,
 	Text = "-",
 	TextColor3 = C.text,
 	Font = Enum.Font.GothamBold,
-	TextSize = 16,
+	TextSize = 18,
 }, titleBar)
 round(colBtn, 6)
 
@@ -168,12 +223,20 @@ local sizeVal = make("TextLabel", {
 	TextXAlignment = Enum.TextXAlignment.Right,
 }, content)
 
+-- Tall invisible hit area so a finger can grab the slider easily
+local sliderHit = make("Frame", {
+	Size = UDim2.new(0, TW, 0, HIT),
+	Position = UDim2.new(0, P, 0, hitY),
+	BackgroundTransparency = 1,
+	Active = true,
+}, content)
+
 local sliderTrack = make("Frame", {
-	Size = UDim2.new(0, TW, 0, 8),
-	Position = UDim2.new(0, P, 0, 29),
+	Size = UDim2.new(1, 0, 0, 8),
+	Position = UDim2.new(0, 0, 0.5, -4),
 	BackgroundColor3 = C.track,
 	BorderSizePixel = 0,
-}, content)
+}, sliderHit)
 round(sliderTrack, 4)
 
 local sliderFill = make("Frame", {
@@ -184,7 +247,7 @@ local sliderFill = make("Frame", {
 round(sliderFill, 4)
 
 local knob = make("TextButton", {
-	Size = UDim2.new(0, 16, 0, 16),
+	Size = UDim2.new(0, KS, 0, KS),
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.new(0.27, 0, 0.5, 0),
 	BackgroundColor3 = C.knob,
@@ -192,11 +255,11 @@ local knob = make("TextButton", {
 	Text = "",
 	ZIndex = 5,
 }, sliderTrack)
-round(knob, 8)
+round(knob, KS / 2)
 
 make("TextLabel", {
 	Size = UDim2.new(1, -P * 2, 0, 14),
-	Position = UDim2.new(0, P, 0, 50),
+	Position = UDim2.new(0, P, 0, matLabelY),
 	BackgroundTransparency = 1,
 	Text = "MATERIAL",
 	TextColor3 = C.sub,
@@ -205,53 +268,62 @@ make("TextLabel", {
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, content)
 
-local BW, BH, BY = (TW - 6) / 2, 28, 68
+local BW = (TW - 6) / 2
 local matBtns = {}
 for i, m in ipairs(MATS) do
 	local col = (i - 1) % 2
 	local row = math.floor((i - 1) / 2)
 	local b = make("TextButton", {
 		Size = UDim2.new(0, BW, 0, BH),
-		Position = UDim2.new(0, P + col * (BW + 6), 0, BY + row * (BH + 5)),
+		Position = UDim2.new(0, P + col * (BW + 6), 0, BY + row * (BH + GAP)),
 		BackgroundColor3 = C.btn,
 		BorderSizePixel = 0,
 		Text = m.label,
 		TextColor3 = C.btnText,
 		Font = Enum.Font.Gotham,
-		TextSize = 11,
+		TextSize = FS,
 	}, content)
 	round(b, 6)
 	outline(b, Color3.fromRGB(35, 70, 140))
 	matBtns[i] = b
 end
 
-local applyY = BY + 3 * (BH + 5) + 4
-local applyBtn = make("TextButton", {
-	Size = UDim2.new(0, TW, 0, 32),
+local refreshBtn = make("TextButton", {
+	Size = UDim2.new(0, BW, 0, AH),
 	Position = UDim2.new(0, P, 0, applyY),
 	BackgroundColor3 = C.accent,
 	BorderSizePixel = 0,
-	Text = "Apply / Rescan",
+	Text = "Refresh",
 	TextColor3 = Color3.fromRGB(220, 240, 255),
 	Font = Enum.Font.GothamBold,
-	TextSize = 13,
+	TextSize = FS + 1,
 }, content)
-round(applyBtn, 7)
+round(refreshBtn, 7)
+
+local decorBtn = make("TextButton", {
+	Size = UDim2.new(0, BW, 0, AH),
+	Position = UDim2.new(0, P + BW + 6, 0, applyY),
+	BackgroundColor3 = C.btn,
+	BorderSizePixel = 0,
+	Text = "",
+	TextColor3 = C.text,
+	Font = Enum.Font.Gotham,
+	TextSize = FS,
+}, content)
+round(decorBtn, 7)
+outline(decorBtn, Color3.fromRGB(35, 70, 140))
 
 local statusLbl = make("TextLabel", {
-	Size = UDim2.new(0, TW, 0, 28),
-	Position = UDim2.new(0, P, 0, applyY + 38),
+	Size = UDim2.new(0, TW, 0, 32),
+	Position = UDim2.new(0, P, 0, statusY),
 	BackgroundTransparency = 1,
 	Text = "Starting...",
 	TextColor3 = C.good,
 	Font = Enum.Font.Gotham,
-	TextSize = 10,
+	TextSize = isTouch and 11 or 10,
 	TextWrapped = true,
 	TextYAlignment = Enum.TextYAlignment.Top,
 }, content)
-
-local fullH = TH + applyY + 74
-main.Size = UDim2.new(0, W, 0, fullH)
 
 local function setStatus(text, color)
 	statusLbl.Text = text
@@ -261,12 +333,6 @@ end
 -- ============================================================
 -- TERRAIN LOGIC
 -- ============================================================
-
-local state = { material = Enum.Material.Grass, mult = 1, cleared = false }
-local plates = {}            -- set of baseplate parts: part -> true
-local MIN_THICK = 8          -- thin baseplates still get a visible terrain layer
-local CHUNK = 1024           -- big baseplates are filled in pieces so FillBlock never fails
-local DROP = 2.5             -- terrain top sits this far below the baseplate surface
 
 local function nameLooksLikeFloor(name)
 	local n = string.lower(name)
@@ -284,32 +350,9 @@ local function isBaseplate(p)
 	return (s.X > 100 and s.Z > 100) or nameLooksLikeFloor(p.Name)
 end
 
-local function fillBox(cf, size, material)
-	local nx = math.max(1, math.ceil(size.X / CHUNK))
-	local nz = math.max(1, math.ceil(size.Z / CHUNK))
-	local cx, cz = size.X / nx, size.Z / nz
-	for ix = 0, nx - 1 do
-		for iz = 0, nz - 1 do
-			local ox = -size.X / 2 + cx * (ix + 0.5)
-			local oz = -size.Z / 2 + cz * (iz + 0.5)
-			terrain:FillBlock(cf * CFrame.new(ox, 0, oz), Vector3.new(cx, size.Y, cz), material)
-		end
-	end
-end
-
-local function fillPlate(p)
-	local s = p.Size
-	local th = math.max(s.Y, MIN_THICK)
-	local localY = (s.Y / 2 - DROP) - th / 2
-	fillBox(
-		p.CFrame * CFrame.new(0, localY, 0),
-		Vector3.new(s.X * state.mult, th, s.Z * state.mult),
-		state.material
-	)
-end
-
 -- Baseplate becomes invisible but stays solid, so walking height stays exact
 local function hide(p)
+	if p == fakePlate then return end
 	if origTrans[p] == nil then origTrans[p] = p.Transparency end
 	p.Transparency = 1
 	p.CanCollide = true
@@ -321,66 +364,195 @@ local function scan()
 	end
 end
 
-local function fillKnown()
-	local n, err = 0, nil
+-- Used only when the game has no baseplate at all (flat 2000x2000 floor at y = 0)
+local function makeFallback()
+	fakePlate = {
+		Parent = true,
+		Transparency = 0,
+		CanCollide = true,
+		Size = Vector3.new(2000, 4, 2000),
+		CFrame = CFrame.new(0, DROP - 2, 0),
+	}
+	plates[fakePlate] = true
+end
+
+-- Splits one baseplate into square tiles so it can be built a few at a time
+local function buildTiles(p, mult)
+	local s = p.Size
+	local sx, sz = s.X * mult, s.Z * mult
+	local nx = math.max(1, math.ceil(sx / TILE))
+	local nz = math.max(1, math.ceil(sz / TILE))
+	local cx, cz = sx / nx, sz / nz
+	local localY = (s.Y / 2 - DROP) - FILL_DEPTH / 2
+	local base = p.CFrame * CFrame.new(0, localY, 0)
+	-- tiles overlap by one voxel so no seams show between them
+	local tileSize = Vector3.new(cx + (nx > 1 and 4 or 0), FILL_DEPTH, cz + (nz > 1 and 4 or 0))
+	local list = {}
+	for ix = 0, nx - 1 do
+		for iz = 0, nz - 1 do
+			local cf = base * CFrame.new(-sx / 2 + cx * (ix + 0.5), 0, -sz / 2 + cz * (iz + 0.5))
+			list[#list + 1] = { cf = cf, size = tileSize, pos = cf.Position, plate = p, d = 0 }
+		end
+	end
+	return list
+end
+
+local function getTiles(p)
+	local e = plateTiles[p]
+	if not e or e.mult ~= applied.mult then
+		e = { mult = applied.mult, list = buildTiles(p, applied.mult) }
+		plateTiles[p] = e
+	end
+	return e.list
+end
+
+local function focusPoint()
+	local ch = player.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if hrp then return hrp.Position end
+	local cam = workspace.CurrentCamera
+	if cam then return cam.CFrame.Position end
+	return Vector3.new(0, 0, 0)
+end
+
+local function flatDist(a, b)
+	local dx, dz = a.X - b.X, a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+-- Finds every tile near the player that still needs building
+local function collect(focus)
+	local pending, remain, partial, count = {}, {}, false, 0
 	for p in pairs(plates) do
 		if p.Parent then
-			local ok, e = pcall(fillPlate, p)
-			if ok then
-				hide(p)
-				n = n + 1
-			else
-				err = err or tostring(e)
+			count = count + 1
+			for _, t in ipairs(getTiles(p)) do
+				local d = flatDist(t.pos, focus)
+				if d <= RADIUS then
+					if not filled[t] then
+						t.d = d
+						pending[#pending + 1] = t
+						remain[p] = (remain[p] or 0) + 1
+					end
+				else
+					partial = true
+				end
 			end
 		else
 			plates[p] = nil
+			plateTiles[p] = nil
 		end
 	end
-	return n, err
+	return pending, remain, partial, count
 end
 
--- returns: plateCount, firstError, usedFallback
-local function applyAll()
-	terrain:Clear()
-	local n, err = fillKnown()
-	if n == 0 then
-		scan()
-		n, err = fillKnown()
-	end
-	if n == 0 then
-		fillBox(CFrame.new(0, -2, 0), Vector3.new(2000 * state.mult, 4, 2000 * state.mult), state.material)
-		return 0, err, true
-	end
-	return n, err, false
+-- Builds terrain closest-to-you first, a few milliseconds per frame, so the game never freezes.
+-- A newer click cancels the older job.
+local function startJob(label, opts)
+	opts = opts or {}
+	jobId = jobId + 1
+	local id = jobId
+	running = true
+	task.spawn(function()
+		local ok, res = pcall(function()
+			local focus = focusPoint()
+			lastFocus = focus
+			if not opts.topUp then
+				applied.mat, applied.mult = state.material, state.mult
+				filled = {}
+			end
+			local mat = applied.mat
+			local pending, remain, partial, count = collect(focus)
+
+			if not opts.topUp then
+				if count == 0 then
+					pcall(scan)
+					if next(plates) == nil then makeFallback() end
+					pending, remain, partial, count = collect(focus)
+				end
+				-- Only wipe terrain when it is really needed (size change, refresh, big maps)
+				if state.needClear or opts.forceClear or state.lastMult ~= applied.mult
+					or (partial and state.lastMat ~= mat) then
+					terrain:Clear()
+					state.needClear = false
+					filled = {}
+				end
+				state.lastMult, state.lastMat = applied.mult, mat
+				pcall(function() terrain.Decoration = state.decor end)
+			end
+
+			table.sort(pending, function(a, b) return a.d < b.d end)
+
+			local total, done, fails, firstErr = #pending, 0, 0, nil
+			local bad = {}
+			local t0 = os.clock()
+			for _, t in ipairs(pending) do
+				if id ~= jobId then return nil end
+				local okFill, e = pcall(terrain.FillBlock, terrain, t.cf, t.size, mat)
+				local p = t.plate
+				if okFill then
+					filled[t] = true
+				else
+					bad[p] = true
+					fails = fails + 1
+					firstErr = firstErr or tostring(e)
+				end
+				done = done + 1
+				remain[p] = remain[p] - 1
+				if remain[p] == 0 and not bad[p] then pcall(hide, p) end
+				if os.clock() - t0 > BUDGET then
+					if not opts.topUp then
+						setStatus(label .. ": " .. math.floor(done / total * 100) .. "%", C.warn)
+					end
+					task.wait()
+					t0 = os.clock()
+				end
+			end
+			return { count = count, partial = partial, fails = fails, err = firstErr, total = total }
+		end)
+
+		if id ~= jobId then return end   -- a newer job took over
+		running = false
+
+		if not ok then
+			setStatus("Error: " .. tostring(res), C.bad)
+			warn("[TerrainGUI] " .. tostring(res))
+		elseif res then
+			if res.fails > 0 then
+				setStatus(label .. ": " .. res.fails .. " tile(s) failed: " .. tostring(res.err), C.bad)
+				warn("[TerrainGUI] " .. tostring(res.err))
+			elseif not opts.topUp then
+				if fakePlate then
+					setStatus(label .. ": no baseplate found, used flat floor", C.warn)
+				elseif res.partial then
+					setStatus(label .. ": done (" .. res.count .. " plate(s), builds around you)", C.good)
+				else
+					setStatus(label .. ": done (" .. res.count .. " plate(s))", C.good)
+				end
+			end
+		end
+	end)
 end
 
 -- Wipes terrain only. Baseplates are kept and made visible again.
 local function clearAll()
+	jobId = jobId + 1       -- cancels any build in progress
+	running = false
 	terrain:Clear()
+	filled = {}
+	state.lastMult = nil
 	for p in pairs(plates) do
-		if p.Parent then
-			local o = origTrans[p]
-			if o == nil or o > 0.9 then o = 0 end
-			p.Transparency = o
-			p.CanCollide = true
-		else
-			plates[p] = nil
+		if p ~= fakePlate then
+			if p.Parent then
+				local o = origTrans[p]
+				if o == nil or o > 0.9 then o = 0 end
+				p.Transparency = o
+				p.CanCollide = true
+			else
+				plates[p] = nil
+				plateTiles[p] = nil
+			end
 		end
-	end
-end
-
-local function runApply(label)
-	local ok, a, b, c = pcall(applyAll)
-	if not ok then
-		setStatus("Error: " .. tostring(a), C.bad)
-		warn("[TerrainGUI] " .. tostring(a))
-	elseif c then
-		setStatus(label .. ": no baseplate found, used flat fill", C.warn)
-	elseif b then
-		setStatus(label .. ": " .. a .. " plate(s) done, some failed", C.warn)
-		warn("[TerrainGUI] " .. tostring(b))
-	else
-		setStatus(label .. ": applied to " .. a .. " baseplate(s)", C.good)
 	end
 end
 
@@ -411,30 +583,41 @@ local function pick(i)
 	else
 		state.cleared = false
 		state.material = m.mat
-		pcall(function()
-			terrain.Decoration = (m.mat == Enum.Material.Grass)
-			terrain:SetMaterialColor(m.mat, m.color)
-		end)
-		runApply(m.label)
+		pcall(function() terrain:SetMaterialColor(m.mat, m.color) end)
+		startJob(m.label)
 	end
 end
 
 for i = 1, #MATS do
-	track(matBtns[i].MouseButton1Click:Connect(function() pick(i) end))
+	track(matBtns[i].Activated:Connect(function() pick(i) end))
 end
 
-track(applyBtn.MouseButton1Click:Connect(function()
+track(refreshBtn.Activated:Connect(function()
+	-- forget everything and rebuild from a fresh scan
 	for p in pairs(plates) do plates[p] = nil end
-	pcall(scan)
+	plateTiles = {}
+	fakePlate = nil
 	if MATS[selectedIdx].mat == nil then
-		setStatus("Rescanned - pick a material to apply", C.warn)
+		pcall(scan)
+		setStatus("Rescanned - pick a material to build", C.warn)
 	else
-		runApply(MATS[selectedIdx].label)
+		state.cleared = false
+		startJob(MATS[selectedIdx].label, { forceClear = true })
 	end
 end))
 
+local function refreshDecorText()
+	decorBtn.Text = "Decor: " .. (state.decor and "On" or "Off")
+end
+refreshDecorText()
+track(decorBtn.Activated:Connect(function()
+	state.decor = not state.decor
+	refreshDecorText()
+	pcall(function() terrain.Decoration = state.decor end)
+end))
+
 -- ============================================================
--- SLIDER + WINDOW DRAG + COLLAPSE
+-- SLIDER + WINDOW DRAG + COLLAPSE (mouse and touch)
 -- ============================================================
 
 local SMIN, SMAX = 0.25, 3.0
@@ -447,6 +630,13 @@ local function setSlider(n)
 end
 setSlider((1.0 - SMIN) / (SMAX - SMIN))
 
+local function isPress(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+local function isMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
+end
+
 local sliding, slideMoved = false, false
 local function slideTo(x)
 	local ap, as = sliderTrack.AbsolutePosition, sliderTrack.AbsoluteSize
@@ -455,21 +645,48 @@ local function slideTo(x)
 		slideMoved = true
 	end
 end
-
-local function isPress(i)
-	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
-end
-local function isMove(i)
-	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
-end
-
-track(knob.MouseButton1Down:Connect(function() sliding = true end))
-track(sliderTrack.InputBegan:Connect(function(i)
+local function startSlide(i)
 	if isPress(i) then
 		sliding = true
 		slideTo(i.Position.X)
 	end
-end))
+end
+track(sliderHit.InputBegan:Connect(startSlide))
+track(knob.InputBegan:Connect(startSlide))
+
+local function viewport()
+	local cam = workspace.CurrentCamera
+	return cam and cam.ViewportSize or Vector2.new(1280, 720)
+end
+
+local function updateScale()
+	local vp = viewport()
+	local s = math.min(1, (vp.Y - 20) / fullH, (vp.X - 20) / W)
+	uiScale.Scale = math.max(0.5, s)
+end
+
+-- keeps the window from being dragged off screen
+local function clampToScreen()
+	local vp = viewport()
+	local ap, as = main.AbsolutePosition, main.AbsoluteSize
+	local dx, dy = 0, 0
+	if ap.X < 0 then dx = -ap.X elseif ap.X + as.X > vp.X then dx = vp.X - ap.X - as.X end
+	if ap.Y < 0 then dy = -ap.Y elseif ap.Y + as.Y > vp.Y then dy = vp.Y - ap.Y - as.Y end
+	if dx ~= 0 or dy ~= 0 then
+		local sc = uiScale.Scale
+		local pos = main.Position
+		main.Position = UDim2.new(pos.X.Scale, pos.X.Offset + dx / sc, pos.Y.Scale, pos.Y.Offset + dy / sc)
+	end
+end
+
+updateScale()
+local cam0 = workspace.CurrentCamera
+if cam0 then
+	track(cam0:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		updateScale()
+		task.defer(clampToScreen)
+	end))
+end
 
 local dStart, dPos
 track(titleBar.InputBegan:Connect(function(i)
@@ -484,26 +701,29 @@ track(UIS.InputChanged:Connect(function(i)
 	if sliding then
 		slideTo(i.Position.X)
 	elseif dStart then
-		local d = i.Position - dStart
+		local d = (i.Position - dStart) / uiScale.Scale
 		main.Position = UDim2.new(dPos.X.Scale, dPos.X.Offset + d.X, dPos.Y.Scale, dPos.Y.Offset + d.Y)
 	end
 end))
 
 track(UIS.InputEnded:Connect(function(i)
 	if not isPress(i) then return end
-	dStart = nil
+	if dStart then
+		dStart = nil
+		clampToScreen()
+	end
 	if sliding then
 		sliding = false
-		-- releasing the slider applies the new size right away
+		-- letting go of the slider rebuilds at the new size
 		if slideMoved and not state.cleared then
-			runApply(MATS[selectedIdx].label)
+			startJob(MATS[selectedIdx].label)
 		end
 		slideMoved = false
 	end
 end))
 
 local collapsed = false
-track(colBtn.MouseButton1Click:Connect(function()
+track(colBtn.Activated:Connect(function()
 	collapsed = not collapsed
 	content.Visible = not collapsed
 	colBtn.Text = collapsed and "+" or "-"
@@ -511,8 +731,21 @@ track(colBtn.MouseButton1Click:Connect(function()
 end))
 
 -- ============================================================
--- AUTO-CONVERT NEW / STREAMED-IN BASEPLATES (incremental, no rescan)
+-- KEEP TERRAIN FOLLOWING YOU + PICK UP NEW BASEPLATES
 -- ============================================================
+
+local acc = 0
+track(RunService.Heartbeat:Connect(function(dt)
+	acc = acc + dt
+	if acc < 0.4 then return end
+	acc = 0
+	if running or state.cleared or not applied.mat then return end
+	local f = focusPoint()
+	if dirty or not lastFocus or flatDist(f, lastFocus) > FOLLOW_STEP then
+		dirty = false
+		startJob("Auto", { topUp = true })
+	end
+end))
 
 track(workspace.DescendantAdded:Connect(function(d)
 	if not d:IsA("BasePart") then return end
@@ -521,12 +754,18 @@ track(workspace.DescendantAdded:Connect(function(d)
 	task.delay(0.3, function()
 		if state.cleared or plates[d] or not d.Parent then return end
 		if isBaseplate(d) then
-			plates[d] = true
-			local ok = pcall(function()
-				fillPlate(d)
-				hide(d)
-			end)
-			if not ok then plates[d] = nil end
+			if fakePlate then
+				-- a real baseplate showed up, so replace the stand-in floor
+				plates[fakePlate] = nil
+				plateTiles[fakePlate] = nil
+				fakePlate = nil
+				state.needClear = true
+				plates[d] = true
+				startJob("Auto")
+			else
+				plates[d] = true
+				dirty = true
+			end
 		end
 	end)
 end))
@@ -537,9 +776,8 @@ end))
 
 highlight(1)
 pcall(function()
-	terrain.Decoration = true
+	terrain.Decoration = state.decor
 	terrain:SetMaterialColor(MATS[1].mat, MATS[1].color)
 end)
-pcall(scan)
-runApply("Grass")
+startJob("Grass")
 print("[TerrainGUI] Loaded")
