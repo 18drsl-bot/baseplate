@@ -203,7 +203,7 @@ make("Frame", {
 	BorderSizePixel = 0,
 }, titleBar)
 make("TextLabel", {
-	Size = UDim2.new(1, -(CB + 16), 1, 0),
+	Size = UDim2.new(1, -(2 * CB + 24), 1, 0),
 	Position = UDim2.new(0, 10, 0, 0),
 	BackgroundTransparency = 1,
 	Text = "Terrain Converter",
@@ -215,7 +215,7 @@ make("TextLabel", {
 
 local colBtn = make("TextButton", {
 	Size = UDim2.new(0, CB, 0, CB),
-	Position = UDim2.new(1, -(CB + 6), 0.5, -CB / 2),
+	Position = UDim2.new(1, -(2 * CB + 12), 0.5, -CB / 2),
 	BackgroundColor3 = Color3.fromRGB(30, 60, 120),
 	BorderSizePixel = 0,
 	Text = "-",
@@ -224,6 +224,18 @@ local colBtn = make("TextButton", {
 	TextSize = 18,
 }, titleBar)
 round(colBtn, 6)
+
+local closeBtn = make("TextButton", {
+	Size = UDim2.new(0, CB, 0, CB),
+	Position = UDim2.new(1, -(CB + 6), 0.5, -CB / 2),
+	BackgroundColor3 = Color3.fromRGB(150, 45, 55),
+	BorderSizePixel = 0,
+	Text = "X",
+	TextColor3 = Color3.fromRGB(255, 225, 225),
+	Font = Enum.Font.GothamBold,
+	TextSize = isTouch and 15 or 13,
+}, titleBar)
+round(closeBtn, 6)
 
 local content = make("Frame", {
 	Name = "Content",
@@ -424,17 +436,21 @@ local function hideAll()
 	end
 end
 
+-- Makes every baseplate visible again. Returns how many it restored.
 local function restorePlates()
+	local n = 0
 	for p in pairs(plates) do
 		if p.Parent then
 			local o = origTrans[p]
 			if o == nil or o > 0.9 then o = 0 end
 			p.Transparency = o
 			p.CanCollide = true
+			n = n + 1
 		else
 			plates[p] = nil
 		end
 	end
+	return n
 end
 
 local function scan()
@@ -728,10 +744,20 @@ local function clearAll()
 	state.cleared = true
 	announce = false
 	queue, qi = {}, 1
-	built, builtCount = {}, 0
 	clearGrass()
-	terrain:Clear()
-	restorePlates()
+	-- baseplates come back FIRST, so the floor is visible even if the terrain wipe fails
+	if next(plates) == nil then pcall(scan) end
+	local shown = restorePlates()
+	local wiped = pcall(function() terrain:Clear() end)
+	if not wiped then
+		-- fall back to erasing just the ground this script built
+		for _, c in pairs(built) do
+			pcall(terrain.FillBlock, terrain, CFrame.new(c.x, (c.yMin + c.yMax) / 2, c.z),
+				Vector3.new(CHUNK, c.yMax - c.yMin, CHUNK), Enum.Material.Air)
+		end
+	end
+	built, builtCount = {}, 0
+	return shown, wiped
 end
 
 track(RunService.Heartbeat:Connect(function(dt)
@@ -789,11 +815,15 @@ local function pick(i)
 	highlight(i)
 	local m = MATS[i]
 	if m.mat == nil then
-		local ok, e = pcall(clearAll)
-		if ok then
-			setStatus("Cleared terrain - baseplates kept", C.good)
+		local ok, shown, wiped = pcall(clearAll)
+		if not ok then
+			setStatus("Error: " .. tostring(shown), C.bad)
+		elseif shown == 0 then
+			setStatus("Cleared terrain - no baseplate found in this game", C.warn)
+		elseif not wiped then
+			setStatus("Erased the generated ground - " .. shown .. " baseplate(s) visible", C.warn)
 		else
-			setStatus("Error: " .. tostring(e), C.bad)
+			setStatus("Cleared terrain - " .. shown .. " baseplate(s) visible", C.good)
 		end
 	else
 		state.material = m.mat
@@ -968,6 +998,37 @@ track(colBtn.Activated:Connect(function()
 	content.Visible = not collapsed
 	colBtn.Text = collapsed and "+" or "-"
 	main.Size = UDim2.new(0, W, 0, collapsed and TH or fullH)
+end))
+
+-- X: tap once to arm, tap again to unload everything this script made
+local closeArmed = false
+track(closeBtn.Activated:Connect(function()
+	if not closeArmed then
+		closeArmed = true
+		closeBtn.Text = "?"
+		local prevText, prevColor = statusLbl.Text, statusLbl.TextColor3
+		setStatus("Tap X again to unload everything", C.warn)
+		task.delay(2.5, function()
+			if closeArmed and closeBtn.Parent then
+				closeArmed = false
+				closeBtn.Text = "X"
+				if statusLbl.Text == "Tap X again to unload everything" then
+					setStatus(prevText, prevColor)
+				end
+			end
+		end)
+		return
+	end
+
+	-- unload: baseplates back, ground + grass removed, everything stopped, GUI deleted
+	pcall(clearAll)
+	for _, c in ipairs(env.TerrainGUIConns or {}) do
+		pcall(function() c:Disconnect() end)
+	end
+	env.TerrainGUIConns = nil
+	env.TerrainOrigTrans = nil
+	pcall(function() grassFolder:Destroy() end)
+	pcall(function() sg:Destroy() end)
 end))
 
 -- ============================================================
