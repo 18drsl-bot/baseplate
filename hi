@@ -84,8 +84,10 @@ local state = {
 	range = DEFAULT_RANGE,
 	active = false,        -- true while ground is being generated
 	cleared = false,       -- true after pressing Clear
-	decor = false,         -- grass blades off = simple flat grass
-	topY = 0,              -- height of the ground surface
+	decor = false,         -- grass blades off = simple grass
+	dropIdx = 4,           -- DROPS[4] = 3 studs below the baseplate
+	chopIdx = 3,           -- CHOPS[3] = "Med"
+	topY = 0,              -- height of the level ground top (bumps dip below this)
 	hadPlate = false,
 	needHide = true,
 }
@@ -149,7 +151,8 @@ local hitY      = 24
 local matLabelY = hitY + HIT + 6
 local BY        = matLabelY + 18
 local applyY    = BY + 3 * (BH + GAP) + 4
-local statusY   = applyY + AH + 6
+local row2Y     = applyY + AH + GAP
+local statusY   = row2Y + AH + 6
 local fullH     = TH + statusY + 32 + 6
 
 local sg = make("ScreenGui", {
@@ -327,6 +330,32 @@ local decorBtn = make("TextButton", {
 round(decorBtn, 7)
 outline(decorBtn, Color3.fromRGB(35, 70, 140))
 
+local dropBtn = make("TextButton", {
+	Size = UDim2.new(0, BW, 0, AH),
+	Position = UDim2.new(0, P, 0, row2Y),
+	BackgroundColor3 = C.btn,
+	BorderSizePixel = 0,
+	Text = "",
+	TextColor3 = C.text,
+	Font = Enum.Font.Gotham,
+	TextSize = FS,
+}, content)
+round(dropBtn, 7)
+outline(dropBtn, Color3.fromRGB(35, 70, 140))
+
+local chopBtn = make("TextButton", {
+	Size = UDim2.new(0, BW, 0, AH),
+	Position = UDim2.new(0, P + BW + 6, 0, row2Y),
+	BackgroundColor3 = C.btn,
+	BorderSizePixel = 0,
+	Text = "",
+	TextColor3 = C.text,
+	Font = Enum.Font.Gotham,
+	TextSize = FS,
+}, content)
+round(chopBtn, 7)
+outline(chopBtn, Color3.fromRGB(35, 70, 140))
+
 local statusLbl = make("TextLabel", {
 	Size = UDim2.new(0, TW, 0, 32),
 	Position = UDim2.new(0, P, 0, statusY),
@@ -416,7 +445,7 @@ local function computeGround()
 	end
 	state.hadPlate = best ~= nil
 	if best then
-		state.topY = best.Position.Y + best.Size.Y / 2 - DROP
+		state.topY = best.Position.Y + best.Size.Y / 2 - DROPS[state.dropIdx]
 	else
 		state.topY = 0
 	end
@@ -444,11 +473,20 @@ local function keyOf(cx, cz)
 	return (cx + 20000) * 40001 + (cz + 20000)
 end
 
+-- Bump strength for the current material (only grass is choppy)
+local function currentAmp()
+	if state.material == Enum.Material.Grass then
+		return CHOPS[state.chopIdx].amp
+	end
+	return 0
+end
+
 -- Works out which chunks to add (nearest first) and which far ones to remove
 local function plan(f)
 	lastFocus = f
 	queue, qi = {}, 1
 	local R = state.range
+	local mat, amp = state.material, currentAmp()
 	local span = math.ceil(R / CHUNK) + 1
 	local fcx, fcz = math.floor(f.X / CHUNK), math.floor(f.Z / CHUNK)
 	for cx = fcx - span, fcx + span do
@@ -459,7 +497,7 @@ local function plan(f)
 			if d <= R then
 				local k = keyOf(cx, cz)
 				local c = built[k]
-				if not c or c.mat ~= state.material then
+				if not c or c.mat ~= mat or c.amp ~= amp then
 					queue[#queue + 1] = { key = k, x = x, z = z, d = d }
 				end
 			end
@@ -475,23 +513,74 @@ local function plan(f)
 	end
 end
 
+-- Builds one chunk as a grid of voxel columns so the grass top can be bumpy.
+-- Every column starts from the same level top and only dips down by its bump depth.
+local function writeChunk(item, mat, amp)
+	local top = state.topY
+	local yMin = math.floor((top - FILL_DEPTH - AMP_MAX) / RES) * RES
+	local yMax = math.ceil(top / RES) * RES + RES
+	local n = CHUNK / RES
+	local ny = (yMax - yMin) / RES
+	local x0, z0 = item.x - CHUNK / 2, item.z - CHUNK / 2
+	local scale = CHOPS[state.chopIdx].scale
+	local air = Enum.Material.Air
+	local mats, occs = {}, {}
+	for ix = 1, n do
+		local mx, oc = {}, {}
+		for iy = 1, ny do
+			mx[iy] = {}
+			oc[iy] = {}
+		end
+		local wx = x0 + (ix - 0.5) * RES
+		for iz = 1, n do
+			local wz = z0 + (iz - 0.5) * RES
+			local depth = 0
+			if amp > 0 then
+				local v = math.noise(wx / scale, wz / scale, 0.37) * 1.2
+					+ math.noise(wx / (scale * 0.4), wz / (scale * 0.4), 5.11) * 0.6
+				depth = amp * math.clamp(v + 0.5, 0, 1)
+			end
+			local h = top - depth
+			for iy = 1, ny do
+				local occ = (h - (yMin + (iy - 1) * RES)) / RES
+				if occ >= 1 then
+					mx[iy][iz] = mat
+					oc[iy][iz] = 1
+				elseif occ > 0.02 then
+					mx[iy][iz] = mat
+					oc[iy][iz] = occ
+				else
+					mx[iy][iz] = air
+					oc[iy][iz] = 0
+				end
+			end
+		end
+		mats[ix] = mx
+		occs[ix] = oc
+	end
+	local region = Region3.new(Vector3.new(x0, yMin, z0), Vector3.new(x0 + CHUNK, yMax, z0 + CHUNK))
+	terrain:WriteVoxels(region, RES, mats, occs)
+	return yMin, yMax
+end
+
 local function processItem(item)
 	if item.unload then
 		local c = built[item.key]
 		if c then
-			pcall(terrain.FillBlock, terrain, CFrame.new(c.x, c.y, c.z), CHUNK_SIZE, Enum.Material.Air)
+			pcall(terrain.FillBlock, terrain, CFrame.new(c.x, (c.yMin + c.yMax) / 2, c.z),
+				Vector3.new(CHUNK, c.yMax - c.yMin, CHUNK), Enum.Material.Air)
 			built[item.key] = nil
 			builtCount = builtCount - 1
 		end
 		return
 	end
+	local mat, amp = state.material, currentAmp()
 	local old = built[item.key]
-	if old and old.mat == state.material then return end
-	local y = state.topY - FILL_DEPTH / 2
-	local ok, e = pcall(terrain.FillBlock, terrain, CFrame.new(item.x, y, item.z), CHUNK_SIZE, state.material)
+	if old and old.mat == mat and old.amp == amp then return end
+	local ok, a, b = pcall(writeChunk, item, mat, amp)
 	if ok then
 		if not old then builtCount = builtCount + 1 end
-		built[item.key] = { x = item.x, y = y, z = item.z, mat = state.material }
+		built[item.key] = { x = item.x, z = item.z, yMin = a, yMax = b, mat = mat, amp = amp }
 		if state.needHide then
 			state.needHide = false
 			hideAll()
@@ -501,8 +590,8 @@ local function processItem(item)
 		state.active = false
 		announce = false
 		queue, qi = {}, 1
-		setStatus("Error: " .. tostring(e), C.bad)
-		warn("[TerrainGUI] " .. tostring(e))
+		setStatus("Error: " .. tostring(a), C.bad)
+		warn("[TerrainGUI] " .. tostring(a))
 	end
 end
 
@@ -633,6 +722,36 @@ track(decorBtn.Activated:Connect(function()
 	state.decor = not state.decor
 	refreshDecorText()
 	pcall(function() terrain.Decoration = state.decor end)
+end))
+
+-- Drop: how far below the baseplate the grass sits (same level everywhere)
+local function refreshDropText()
+	dropBtn.Text = "Drop: " .. DROPS[state.dropIdx]
+end
+refreshDropText()
+track(dropBtn.Activated:Connect(function()
+	state.dropIdx = state.dropIdx % #DROPS + 1
+	refreshDropText()
+	computeGround()
+	if state.active then
+		beginBuild(state.label, true)   -- the level changed, so rebuild from scratch
+	end
+end))
+
+-- Chop: how bumpy the grass is
+local function refreshChopText()
+	chopBtn.Text = "Chop: " .. CHOPS[state.chopIdx].name
+end
+refreshChopText()
+track(chopBtn.Activated:Connect(function()
+	state.chopIdx = state.chopIdx % #CHOPS + 1
+	refreshChopText()
+	if state.active then
+		announce = true
+		dirty = true
+		planTimer = 1
+		setStatus(state.label .. ": reshaping...", C.warn)
+	end
 end))
 
 -- ============================================================
